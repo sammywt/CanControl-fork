@@ -1,4 +1,10 @@
 # CanControl
+TO RUN EXISTING CODE IN CURRENT BRANCH (attempt-adding-ctrl)
+command in terminal is: pio run -e uno -t upload && pio device monitor -b 115200
+
+use L or R followed by float (2 places) can take numbers from -1 to 1 in increments of .01
+EX: L.01 + enter key OR R-.5 + enter key
+0 + enter key stops both motors
 
 **CanControl** is a library for controlling CAN-based motor controllers (REV Spark MAX, CTRE Talon SRX, Victor SPX) from **Arduino** boards using an **MCP2515 CAN Shield**.
 CanControl currently supports:
