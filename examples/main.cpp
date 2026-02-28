@@ -38,7 +38,7 @@ const uint8_t STATUS_SIZE = 2;
 // Function Prototypes
 void pack_data(can_frame &frame, const uint8_t *data, const int size);
 void create_data(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size);
-void send_control_frame(const uint32_t device_id, const control_mode mode, const float setpoint);
+void send_control_frame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint);
 
 static void spi_bit_modify(uint8_t reg, uint8_t mask, uint8_t val) {
   digitalWrite(10, LOW);
@@ -49,7 +49,8 @@ static void spi_bit_modify(uint8_t reg, uint8_t mask, uint8_t val) {
   digitalWrite(10, HIGH);
 }
 
-static float duty = 0.3;
+static float duty_left = 0.3;
+static float duty_right = 0.3;
 static char inBuf[16];
 static uint8_t inPos = 0;
 
@@ -59,9 +60,11 @@ void setup() {
     ;
 
   Serial.println("CAN CONTROLLER");
-  Serial.println("Type a duty cycle (-1.0 to 1.0) and press Enter.");
-  Serial.print("Current duty: ");
-  Serial.println(duty);
+  Serial.println("Commands: L0.5 (left), R0.5 (right), B0.5 (both), 0.5 (both)");
+  Serial.print("Current duty L=");
+  Serial.print(duty_left);
+  Serial.print(" R=");
+  Serial.println(duty_right);
 
   heartbeat_frame.can_id = HEARTBEAT_ID | CAN_EFF_FLAG;
   heartbeat_frame.can_dlc = HEARTBEAT_SIZE;
@@ -82,11 +85,21 @@ void loop() {
     if (c == '\n' || c == '\r') {
       if (inPos > 0) {
         inBuf[inPos] = '\0';
-        duty = atof(inBuf);
-        if (duty > 1.0f) duty = 1.0f;
-        if (duty < -1.0f) duty = -1.0f;
-        Serial.print("Set duty: ");
-        Serial.println(duty);
+        char target = 'B';
+        const char* numStart = inBuf;
+        if (inBuf[0] == 'L' || inBuf[0] == 'l' || inBuf[0] == 'R' || inBuf[0] == 'r' || inBuf[0] == 'B' || inBuf[0] == 'b') {
+          target = inBuf[0] & 0xDF; // uppercase
+          numStart = inBuf + 1;
+        }
+        float val = atof(numStart);
+        if (val > 1.0f) val = 1.0f;
+        if (val < -1.0f) val = -1.0f;
+        if (target == 'L' || target == 'B') duty_left = val;
+        if (target == 'R' || target == 'B') duty_right = val;
+        Serial.print("Duty L=");
+        Serial.print(duty_left);
+        Serial.print(" R=");
+        Serial.println(duty_right);
         inPos = 0;
       }
     } else if (inPos < sizeof(inBuf) - 1) {
@@ -107,10 +120,11 @@ void loop() {
     hb_last = now;
   }
 
-  // Send control on TXB1 every 10ms, offset by 5ms
+  // Send control to both motors every 10ms, offset by 5ms
   static unsigned long ctrl_last = 5;
   if (now - ctrl_last >= 10) {
-    send_control_frame(1, Duty_Cycle_Set, duty);
+    send_control_frame(MCP2515::TXB1, 1, Duty_Cycle_Set, duty_left);
+    send_control_frame(MCP2515::TXB2, 2, Duty_Cycle_Set, duty_right);
     ctrl_last = now;
   }
 }
@@ -134,10 +148,10 @@ void create_data(const void* data, byte *frame_data, const uint8_t data_size, co
   }
 }
 
-void send_control_frame(const uint32_t device_id, const control_mode mode, const float setpoint) {
+void send_control_frame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint) {
   control_frame.can_id = (mode + device_id) | CAN_EFF_FLAG;
   byte control_data[CONTROL_SIZE];
   create_data(&setpoint, control_data, 4, CONTROL_SIZE);
   pack_data(control_frame, control_data, CONTROL_SIZE);
-  mcp2515.sendMessage(MCP2515::TXB1, &control_frame);
+  mcp2515.sendMessage(txb, &control_frame);
 }
