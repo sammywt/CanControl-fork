@@ -6,6 +6,10 @@ use L or R followed by float (2 places) can take numbers from -1 to 1 in increme
 EX: L.01 + enter key OR R-.5 + enter key
 0 + enter key stops both motors
 
+# Xbox Controller Input
+Added xbox controller communication through TX from ESP32 to pin 3 on the Arduino. Packet recieved contains CSV data for all controller inputs. Code reads trigger data and moves corresponding motor with a range of 0.0 for no trigger input and 0.5 for full trigger pushes.
+TODO: Change to control stick movement (Should be easy, just parse different data)
+
 **CanControl** is a library for controlling CAN-based motor controllers (REV Spark MAX, CTRE Talon SRX, Victor SPX) from **Arduino** boards using an **MCP2515 CAN Shield**.
 CanControl currently supports:
 
