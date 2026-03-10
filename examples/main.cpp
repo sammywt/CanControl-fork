@@ -7,6 +7,17 @@ SoftwareSerial Serial1(3, -1);  // RX=Pin3
 
 MCP2515 mcp2515(10);
 
+// RGB LED PINS (Common Anode)
+const int redPin   = 6;
+const int greenPin = 5;
+const int bluePin  = 4;
+
+void setColor(int r, int g, int b) {
+  analogWrite(redPin,   255 - r);
+  analogWrite(greenPin, 255 - g);
+  analogWrite(bluePin,  255 - b);
+}
+
 // CONTROL MODES
 enum control_mode {
   Duty_Cycle_Set     = 0x2050080,
@@ -40,8 +51,6 @@ const uint8_t CONTROL_SIZE = 8;
 const float MAX_DUTY        = 1.0f;
 const float DEADZONE        = 0.15f;
 const float RESPONSE        = 2.0f;
-// Ramp rates are now per-millisecond (loop calls ramp every ms via timer)
-// 0.001 per ms = full speed in ~350ms, tune to taste
 const float RAMP_RATE_ACCEL = 0.001f;
 const float RAMP_RATE_DECEL = 0.001f;
 
@@ -52,18 +61,18 @@ float duty_left_current  = 0.0f;
 float duty_right_current = 0.0f;
 
 // ENCODER / SENSOR STATE
-float   velocity_left  = 0.0f;  // RPM
-float   velocity_right = 0.0f;  // RPM
-float   position_left  = 0.0f;  // rotations
-float   position_right = 0.0f;  // rotations
-float   current_left   = 0.0f;  // amps
-float   current_right  = 0.0f;  // amps
-uint8_t temp_left      = 0;     // °C
-uint8_t temp_right     = 0;     // °C
-float   voltage        = 0.0f;  // volts (smoothed)
-float   battery_pct    = 0.0f;  // 0-100%
+float   velocity_left  = 0.0f;
+float   velocity_right = 0.0f;
+float   position_left  = 0.0f;
+float   position_right = 0.0f;
+float   current_left   = 0.0f;
+float   current_right  = 0.0f;
+uint8_t temp_left      = 0;
+uint8_t temp_right     = 0;
+float   voltage        = 0.0f;
+float   battery_pct    = 0.0f;
 
-// Rolling average for voltage — larger N = smoother but slower to respond
+// Rolling average for voltage
 static constexpr int VOLTAGE_SAMPLES = 20;
 float voltage_buf[VOLTAGE_SAMPLES] = {};
 int   voltage_idx                  = 0;
@@ -79,8 +88,6 @@ float addVoltageSample(float v) {
   return sum / count;
 }
 
-// RAW BYTE DEBUG — set true to print raw status bytes to verify scaling
-// Keep false during normal use — floods serial and causes dropped characters
 static bool DEBUG_RAW_BYTES = false;
 
 // SERIAL PARSER
@@ -98,16 +105,61 @@ char buffer[64];
 uint8_t bufIdx = 0;
 
 // ─────────────────────────────────────────────
-// BATTERY PERCENTAGE
-// Adjust min_v / max_v for your LiPo cell count:
-//   3S: max=12.6  min=10.5
-//   4S: max=16.8  min=13.2
-//   5S: max=21.0  min=16.5
-//   6S: max=25.2  min=19.8
+// BUTTON BIT MASKS
+// Adjust these to match your controller's CSV button field encoding.
+// These are standard Xbox controller bit positions — verify against
+// your actual serial output if colors don't trigger correctly.
 // ─────────────────────────────────────────────
+const int BTN_A    = (1 << 0);   // Green
+const int BTN_B    = (1 << 1);   // Red
+const int BTN_X    = (1 << 2);   // Blue
+const int BTN_Y    = (1 << 3);   // Yellow
+const int BTN_LB   = (1 << 4);   // Purple
+const int BTN_RB   = (1 << 5);   // White
+const int BTN_LS   = (1 << 8);   // Left Stick Click
+const int BTN_RS   = (1 << 9);   // Right Stick Click
+// Left Trigger  (brake)    → LED OFF
+// Right Trigger (throttle) → Rainbow
+
+// LED STATE — persists until a new button is pressed
+int led_r = 0, led_g = 0, led_b = 0;
+
+// RAINBOW STATE
+bool rainbow_mode = false;
+float rainbow_hue = 0.0f;  // 0.0 - 360.0 degrees
+
+// HSV to RGB helper (H: 0-360, S/V: 0-1)
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
+  float c = v * s;
+  float x = c * (1.0f - fabs(fmod(h / 60.0f, 2.0f) - 1.0f));
+  float m = v - c;
+  float r1, g1, b1;
+  if      (h <  60) { r1 = c; g1 = x; b1 = 0; }
+  else if (h < 120) { r1 = x; g1 = c; b1 = 0; }
+  else if (h < 180) { r1 = 0; g1 = c; b1 = x; }
+  else if (h < 240) { r1 = 0; g1 = x; b1 = c; }
+  else if (h < 300) { r1 = x; g1 = 0; b1 = c; }
+  else              { r1 = c; g1 = 0; b1 = x; }
+  r = (int)((r1 + m) * 255);
+  g = (int)((g1 + m) * 255);
+  b = (int)((b1 + m) * 255);
+}
+
+void handleLEDButtons(int buttons) {
+  if      (buttons & BTN_A)  { rainbow_mode = false; led_r =   0; led_g = 255; led_b =   0; }  // Green
+  else if (buttons & BTN_B)  { rainbow_mode = false; led_r = 255; led_g =   0; led_b =   0; }  // Red
+  else if (buttons & BTN_Y)  { rainbow_mode = false; led_r = 255; led_g = 180; led_b =   0; }  // Yellow
+  else if (buttons & BTN_X)  { rainbow_mode = false; led_r =   0; led_g =   0; led_b = 255; }  // Blue
+  else if (buttons & BTN_LB) { rainbow_mode = false; led_r = 148; led_g =   0; led_b = 211; }  // Purple
+  else if (buttons & BTN_RB) { rainbow_mode = false; led_r = 255; led_g = 255; led_b = 255; }  // White
+
+  if (!rainbow_mode) setColor(led_r, led_g, led_b);
+}
+
+// BATTERY PERCENTAGE
 float batteryPercent(float v) {
-  const float max_v = 12.6f;  // 3S fully charged
-  const float min_v = 10.5f;  // 3S cutoff (stop using below this)
+  const float max_v = 12.6f;
+  const float min_v = 10.5f;
   float pct = (v - min_v) / (max_v - min_v) * 100.0f;
   if (pct > 100.0f) pct = 100.0f;
   if (pct <   0.0f) pct =   0.0f;
@@ -226,11 +278,6 @@ void send_control_frame(MCP2515::TXBn txb, const uint32_t device_id, const contr
   mcp2515.sendMessage(txb, &control_frame);
 }
 
-// ─────────────────────────────────────────────
-// RAW BYTE DEBUG PRINTER
-// Prints all 8 bytes of a status frame as hex and decimal
-// so you can figure out the real scaling for current/voltage
-// ─────────────────────────────────────────────
 void printRawBytes(const char* label, const struct can_frame& frame) {
   Serial.print(label);
   Serial.print(" RAW [hex]: ");
@@ -253,6 +300,12 @@ void setup() {
   Serial1.begin(9600);
   Serial.println("CAN CONTROLLER READY");
 
+  // RGB LED INIT
+  pinMode(redPin,   OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin,  OUTPUT);
+  setColor(0, 0, 0);  // Off on startup
+
   heartbeat_frame.can_id  = HEARTBEAT_ID | CAN_EFF_FLAG;
   heartbeat_frame.can_dlc = 8;
   pack_data(heartbeat_frame, HEARTBEAT_DATA, 8);
@@ -271,8 +324,13 @@ void loop() {
     char c = Serial1.read();
     if (c == '\n') {
       buffer[bufIdx] = '\0';
-      if (bufIdx > 0 && parseCSV(buffer, controller))
+      if (bufIdx > 0 && parseCSV(buffer, controller)) {
         computeMotorFromStick();
+        handleLEDButtons(controller.buttons);  // Update LED on every new controller frame
+        // Triggers: left = LED off, right = rainbow
+        if      (controller.brake    > 10) { rainbow_mode = false; led_r = 0; led_g = 0; led_b = 0; setColor(0, 0, 0); }
+        else if (controller.throttle > 10) { rainbow_mode = true; }
+      }
       bufIdx = 0;
     } else if (c != '\r' && bufIdx < sizeof(buffer) - 1) {
       buffer[bufIdx++] = c;
@@ -283,7 +341,18 @@ void loop() {
 
   unsigned long now = millis();
 
-  // RAMP MOTORS — gated to run once per ms so rate is time-based not loop-speed-based
+  // RAINBOW UPDATE every 20ms
+  static unsigned long rainbow_last = 0;
+  if (rainbow_mode && now - rainbow_last >= 20) {
+    rainbow_hue += 2.0f;
+    if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
+    int r, g, b;
+    hsvToRgb(rainbow_hue, 1.0f, 1.0f, r, g, b);
+    setColor(r, g, b);
+    rainbow_last = now;
+  }
+
+  // RAMP MOTORS
   static unsigned long ramp_last = 0;
   if (now - ramp_last >= 1) {
     updateMotorRamp();
@@ -318,33 +387,19 @@ void loop() {
 
     uint32_t id = rx.can_id & ~CAN_EFF_FLAG;
 
-    // ── STATUS 1 ──────────────────────────────────────────────────────────
-    // Byte layout (per SparkMax CAN protocol):
-    //   [0-3] velocity  → float, RPM
-    //   [4]   temp      → uint8, °C  ✓ confirmed
-    //   [5]   voltage   → uint8, *0.1 = volts (e.g. 175 → 17.5V) ✓ confirmed
-    //   [6]   current   → uint8, *0.125 = amps ✓ confirmed (5 → 0.625A at idle)
-    //   [7]   unknown   → almost always 0, likely fault flags
-    // ─────────────────────────────────────────────────────────────────────
     if (id == (status_1 + 1)) {
       memcpy(&velocity_left, rx.data, 4);
       temp_left    = rx.data[4];
-      // Clamp current — spikes above ~40A are corrupt frames, not real current
       float raw_current_l = rx.data[6] * 0.125f;
       current_left = (raw_current_l < 40.0f) ? raw_current_l : current_left;
-      // rx.data[7] appears to be fault flags, ignored for now
-      float new_voltage = rx.data[5] * 0.0658f;   // calibrated against REV Hardware Client (avg 11.00V)
-      // Ignore readings below 10V — SparkMax reports junk when battery is absent
+      float new_voltage = rx.data[5] * 0.0658f;
       if (new_voltage >= 10.0f) {
         voltage = addVoltageSample(new_voltage);
-        // Only update battery % when motors are near idle — avoids voltage sag skewing the reading
-        // duty threshold of 0.05 gives a small buffer above true zero
         bool motors_idle = fabs(duty_left_current) < 0.05f && fabs(duty_right_current) < 0.05f;
         if (motors_idle) {
           battery_pct = batteryPercent(voltage);
         }
       }
-
       if (DEBUG_RAW_BYTES) printRawBytes("S1_L", rx);
     }
     else if (id == (status_1 + 2)) {
@@ -352,23 +407,14 @@ void loop() {
       temp_right    = rx.data[4];
       float raw_current_r = rx.data[6] * 0.125f;
       current_right = (raw_current_r < 40.0f) ? raw_current_r : current_right;
-
       if (DEBUG_RAW_BYTES) printRawBytes("S1_R", rx);
     }
-
-    // ── STATUS 2 ──────────────────────────────────────────────────────────
-    // Byte layout:
-    //   [0-3] position → float, rotations
-    //   [4-7] unknown  → printing raw to figure out
-    // ─────────────────────────────────────────────────────────────────────
     else if (id == (status_2 + 1)) {
       memcpy(&position_left, rx.data, 4);
-
       if (DEBUG_RAW_BYTES) printRawBytes("S2_L", rx);
     }
     else if (id == (status_2 + 2)) {
       memcpy(&position_right, rx.data, 4);
-
       if (DEBUG_RAW_BYTES) printRawBytes("S2_R", rx);
     }
   }
