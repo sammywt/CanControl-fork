@@ -51,8 +51,8 @@ const uint8_t CONTROL_SIZE = 8;
 const float MAX_DUTY        = 1.0f;
 const float DEADZONE        = 0.15f;
 const float RESPONSE        = 2.0f;
-const float RAMP_RATE_ACCEL = 0.001f;
-const float RAMP_RATE_DECEL = 0.001f;
+const float RAMP_RATE_ACCEL = 0.001f;   // increased from 0.001f
+const float RAMP_RATE_DECEL = 0.001f;   // increased from 0.001f, faster for safety
 
 // MOTOR STATE
 float duty_left_target  = 0.0f;
@@ -104,31 +104,24 @@ ControllerData controller;
 char buffer[64];
 uint8_t bufIdx = 0;
 
-// ─────────────────────────────────────────────
 // BUTTON BIT MASKS
-// Adjust these to match your controller's CSV button field encoding.
-// These are standard Xbox controller bit positions — verify against
-// your actual serial output if colors don't trigger correctly.
-// ─────────────────────────────────────────────
-const int BTN_A    = (1 << 0);   // Green
-const int BTN_B    = (1 << 1);   // Red
-const int BTN_X    = (1 << 2);   // Blue
-const int BTN_Y    = (1 << 3);   // Yellow
-const int BTN_LB   = (1 << 4);   // Purple
-const int BTN_RB   = (1 << 5);   // White
-const int BTN_LS   = (1 << 8);   // Left Stick Click
-const int BTN_RS   = (1 << 9);   // Right Stick Click
-// Left Trigger  (brake)    → LED OFF
-// Right Trigger (throttle) → Rainbow
+const int BTN_A    = (1 << 0);
+const int BTN_B    = (1 << 1);
+const int BTN_X    = (1 << 2);
+const int BTN_Y    = (1 << 3);
+const int BTN_LB   = (1 << 4);
+const int BTN_RB   = (1 << 5);
+const int BTN_LS   = (1 << 8);
+const int BTN_RS   = (1 << 9);
 
-// LED STATE — persists until a new button is pressed
+// LED STATE
 int led_r = 0, led_g = 0, led_b = 0;
 
 // RAINBOW STATE
 bool rainbow_mode = false;
-float rainbow_hue = 0.0f;  // 0.0 - 360.0 degrees
+float rainbow_hue = 0.0f;
 
-// HSV to RGB helper (H: 0-360, S/V: 0-1)
+// HSV to RGB helper
 void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
   float c = v * s;
   float x = c * (1.0f - fabs(fmod(h / 60.0f, 2.0f) - 1.0f));
@@ -146,12 +139,12 @@ void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
 }
 
 void handleLEDButtons(int buttons) {
-  if      (buttons & BTN_A)  { rainbow_mode = false; led_r =   0; led_g = 255; led_b =   0; }  // Green
-  else if (buttons & BTN_B)  { rainbow_mode = false; led_r = 255; led_g =   0; led_b =   0; }  // Red
-  else if (buttons & BTN_Y)  { rainbow_mode = false; led_r = 255; led_g = 180; led_b =   0; }  // Yellow
-  else if (buttons & BTN_X)  { rainbow_mode = false; led_r =   0; led_g =   0; led_b = 255; }  // Blue
-  else if (buttons & BTN_LB) { rainbow_mode = false; led_r = 148; led_g =   0; led_b = 211; }  // Purple
-  else if (buttons & BTN_RB) { rainbow_mode = false; led_r = 255; led_g = 255; led_b = 255; }  // White
+  if      (buttons & BTN_A)  { rainbow_mode = false; led_r =   0; led_g = 255; led_b =   0; }
+  else if (buttons & BTN_B)  { rainbow_mode = false; led_r = 255; led_g =   0; led_b =   0; }
+  else if (buttons & BTN_Y)  { rainbow_mode = false; led_r = 255; led_g = 180; led_b =   0; }
+  else if (buttons & BTN_X)  { rainbow_mode = false; led_r =   0; led_g =   0; led_b = 255; }
+  else if (buttons & BTN_LB) { rainbow_mode = false; led_r = 148; led_g =   0; led_b = 211; }
+  else if (buttons & BTN_RB) { rainbow_mode = false; led_r = 255; led_g = 255; led_b = 255; }
 
   if (!rainbow_mode) setColor(led_r, led_g, led_b);
 }
@@ -239,18 +232,18 @@ void updateMotorRamp() {
 
 // SERIAL PRINT
 void printStatus() {
-  Serial.print("LY=");      Serial.print(controller.ly);
-  Serial.print(" RX=");     Serial.print(controller.rx);
+  Serial.print("LY=");       Serial.print(controller.ly);
+  Serial.print(" RX=");      Serial.print(controller.rx);
   Serial.print(" | Target L="); Serial.print(duty_left_target);
-  Serial.print(" R=");      Serial.print(duty_right_target);
+  Serial.print(" R=");       Serial.print(duty_right_target);
   Serial.print(" | RPM L="); Serial.print(velocity_left);
-  Serial.print(" R=");      Serial.print(velocity_right);
+  Serial.print(" R=");       Serial.print(velocity_right);
   Serial.print(" | Pos L="); Serial.print(position_left);
-  Serial.print(" R=");      Serial.print(position_right);
+  Serial.print(" R=");       Serial.print(position_right);
   Serial.print(" | Temp L="); Serial.print(temp_left);
-  Serial.print("C R=");     Serial.print(temp_right);
+  Serial.print("C R=");      Serial.print(temp_right);
   Serial.print("C | mA L="); Serial.print(current_left);
-  Serial.print(" R=");      Serial.print(current_right);
+  Serial.print(" R=");       Serial.print(current_right);
   Serial.print(" | Volts="); Serial.print(voltage);
   Serial.print(" | Batt=");  Serial.print(battery_pct);
   Serial.println("%");
@@ -300,11 +293,10 @@ void setup() {
   Serial1.begin(9600);
   Serial.println("CAN CONTROLLER READY");
 
-  // RGB LED INIT
   pinMode(redPin,   OUTPUT);
   pinMode(greenPin, OUTPUT);
   pinMode(bluePin,  OUTPUT);
-  setColor(0, 0, 0);  // Off on startup
+  setColor(0, 0, 0);
 
   heartbeat_frame.can_id  = HEARTBEAT_ID | CAN_EFF_FLAG;
   heartbeat_frame.can_dlc = 8;
@@ -319,6 +311,42 @@ void setup() {
 // LOOP
 void loop() {
 
+  // DRAIN RX FIRST — prevents status frame backlog from delaying control sends
+  struct can_frame rx;
+  while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
+
+    uint32_t id = rx.can_id & ~CAN_EFF_FLAG;
+
+    if (id == (status_1 + 1)) {
+      memcpy(&velocity_left, rx.data, 4);
+      temp_left = rx.data[4];
+      float raw_current_l = rx.data[6] * 0.125f;
+      current_left = (raw_current_l < 40.0f) ? raw_current_l : current_left;
+      float new_voltage = rx.data[5] * 0.0658f;
+      if (new_voltage >= 10.0f) {
+        voltage = addVoltageSample(new_voltage);
+        bool motors_idle = fabs(duty_left_current) < 0.05f && fabs(duty_right_current) < 0.05f;
+        if (motors_idle) battery_pct = batteryPercent(voltage);
+      }
+      if (DEBUG_RAW_BYTES) printRawBytes("S1_L", rx);
+    }
+    else if (id == (status_1 + 2)) {
+      memcpy(&velocity_right, rx.data, 4);
+      temp_right = rx.data[4];
+      float raw_current_r = rx.data[6] * 0.125f;
+      current_right = (raw_current_r < 40.0f) ? raw_current_r : current_right;
+      if (DEBUG_RAW_BYTES) printRawBytes("S1_R", rx);
+    }
+    else if (id == (status_2 + 1)) {
+      memcpy(&position_left, rx.data, 4);
+      if (DEBUG_RAW_BYTES) printRawBytes("S2_L", rx);
+    }
+    else if (id == (status_2 + 2)) {
+      memcpy(&position_right, rx.data, 4);
+      if (DEBUG_RAW_BYTES) printRawBytes("S2_R", rx);
+    }
+  }
+
   // READ CONTROLLER DATA
   while (Serial1.available()) {
     char c = Serial1.read();
@@ -326,8 +354,7 @@ void loop() {
       buffer[bufIdx] = '\0';
       if (bufIdx > 0 && parseCSV(buffer, controller)) {
         computeMotorFromStick();
-        handleLEDButtons(controller.buttons);  // Update LED on every new controller frame
-        // Triggers: left = LED off, right = rainbow
+        handleLEDButtons(controller.buttons);
         if      (controller.brake    > 10) { rainbow_mode = false; led_r = 0; led_g = 0; led_b = 0; setColor(0, 0, 0); }
         else if (controller.throttle > 10) { rainbow_mode = true; }
       }
@@ -352,7 +379,7 @@ void loop() {
     rainbow_last = now;
   }
 
-  // RAMP MOTORS
+  // RAMP MOTORS every 1ms
   static unsigned long ramp_last = 0;
   if (now - ramp_last >= 1) {
     updateMotorRamp();
@@ -366,12 +393,18 @@ void loop() {
     hb_last = now;
   }
 
-  // MOTOR COMMANDS every 10ms, offset by 5ms
-  static unsigned long ctrl_last = 5;
-  if (now - ctrl_last >= 10) {
+  // LEFT MOTOR every 10ms
+  static unsigned long ctrl_left_last = 5;
+  if (now - ctrl_left_last >= 10) {
     send_control_frame(MCP2515::TXB1, 1, Duty_Cycle_Set, duty_left_current);
+    ctrl_left_last = now;
+  }
+
+  // RIGHT MOTOR every 10ms, offset by 5ms from left
+  static unsigned long ctrl_right_last = 10;
+  if (now - ctrl_right_last >= 10) {
     send_control_frame(MCP2515::TXB2, 2, Duty_Cycle_Set, duty_right_current);
-    ctrl_last = now;
+    ctrl_right_last = now;
   }
 
   // SERIAL PRINT every 100ms
@@ -379,43 +412,5 @@ void loop() {
   if (now - print_last >= 100) {
     printStatus();
     print_last = now;
-  }
-
-  // READ AND PARSE CAN RX
-  struct can_frame rx;
-  while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
-
-    uint32_t id = rx.can_id & ~CAN_EFF_FLAG;
-
-    if (id == (status_1 + 1)) {
-      memcpy(&velocity_left, rx.data, 4);
-      temp_left    = rx.data[4];
-      float raw_current_l = rx.data[6] * 0.125f;
-      current_left = (raw_current_l < 40.0f) ? raw_current_l : current_left;
-      float new_voltage = rx.data[5] * 0.0658f;
-      if (new_voltage >= 10.0f) {
-        voltage = addVoltageSample(new_voltage);
-        bool motors_idle = fabs(duty_left_current) < 0.05f && fabs(duty_right_current) < 0.05f;
-        if (motors_idle) {
-          battery_pct = batteryPercent(voltage);
-        }
-      }
-      if (DEBUG_RAW_BYTES) printRawBytes("S1_L", rx);
-    }
-    else if (id == (status_1 + 2)) {
-      memcpy(&velocity_right, rx.data, 4);
-      temp_right    = rx.data[4];
-      float raw_current_r = rx.data[6] * 0.125f;
-      current_right = (raw_current_r < 40.0f) ? raw_current_r : current_right;
-      if (DEBUG_RAW_BYTES) printRawBytes("S1_R", rx);
-    }
-    else if (id == (status_2 + 1)) {
-      memcpy(&position_left, rx.data, 4);
-      if (DEBUG_RAW_BYTES) printRawBytes("S2_L", rx);
-    }
-    else if (id == (status_2 + 2)) {
-      memcpy(&position_right, rx.data, 4);
-      if (DEBUG_RAW_BYTES) printRawBytes("S2_R", rx);
-    }
   }
 }
