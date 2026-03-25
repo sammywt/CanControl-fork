@@ -48,11 +48,11 @@ struct can_frame control_frame;
 const uint8_t CONTROL_SIZE = 8;
 
 // DRIVING CONSTANTS
-const float MAX_DUTY        = 1.0f;
+const float MAX_DUTY        = 0.3f;
 const float DEADZONE        = 0.15f;
 const float RESPONSE        = 2.0f;
-const float RAMP_RATE_ACCEL = 0.001f;
-const float RAMP_RATE_DECEL = 0.001f;
+const float RAMP_RATE_ACCEL = 0.002f;
+const float RAMP_RATE_DECEL = 0.002f;
 
 // MOTOR STATE
 float duty_left_target  = 0.0f;
@@ -201,9 +201,11 @@ float applyCurve(float v) {
 }
 
 // MOTOR DRIVE
+// Left stick up/down (ly):     up = forward, down = backward
+// Right stick left/right (rx): right = turn right, left = turn left
 void computeMotorFromStick() {
-  float y = -controller.ly / 512.0f;
-  float x =  controller.rx / 512.0f;
+  float y =  controller.rx / 512.0f;   // throttle
+  float x = -controller.ly / 512.0f;   // steering
   x = applyDeadzone(x);
   y = applyDeadzone(y);
   x = applyCurve(x);
@@ -344,7 +346,7 @@ void loop() {
   // RAINBOW UPDATE every 20ms
   static unsigned long rainbow_last = 0;
   if (rainbow_mode && now - rainbow_last >= 20) {
-    rainbow_hue += 2.0f;
+    rainbow_hue += 4.0f;
     if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
     int r, g, b;
     hsvToRgb(rainbow_hue, 1.0f, 1.0f, r, g, b);
