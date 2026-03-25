@@ -51,13 +51,8 @@ const uint8_t CONTROL_SIZE = 8;
 const float MAX_DUTY        = 0.3f;
 const float DEADZONE        = 0.15f;
 const float RESPONSE        = 2.0f;
-<<<<<<< HEAD
 const float RAMP_RATE_ACCEL = 0.002f;
 const float RAMP_RATE_DECEL = 0.002f;
-=======
-const float RAMP_RATE_ACCEL = 0.001f;   // increased from 0.001f
-const float RAMP_RATE_DECEL = 0.001f;   // increased from 0.001f, faster for safety
->>>>>>> a0a2a1571452a2c4e2775822ffc1f5f74719fc68
 
 // MOTOR STATE
 float duty_left_target  = 0.0f;
