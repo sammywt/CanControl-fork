@@ -1,24 +1,50 @@
+#include <Arduino.h>
 #include <SPI.h>
 #include <mcp2515.h>
 #include <SoftwareSerial.h>
 #include <math.h>
+#include "DFRobotDFPlayerMini.h"
 
-SoftwareSerial Serial1(3, -1);  // RX=Pin3
+// PIN ASSIGNMENTS
+// 2       = CAN INT
+// 3       = Controller serial RX (from Nano)
+// 4       = Blue LED (digital on/off, no PWM on this pin)
+// 5       = Green LED (PWM)
+// 6       = Red LED (PWM)
+// 7       = DFPlayer RX (from player)
+// 8       = DFPlayer TX (to player)
+// 9       = DRV8871 IN2 (PWM speed control)
+// 10..13  = SPI for MCP2515 CAN
+// A0      = DRV8871 IN1 (direction, digital only)
+
+SoftwareSerial controllerSerial(3, -1);  // RX only from Nano
+SoftwareSerial dfPlayerSerial(7, 8);     // RX, TX for DFPlayer Mini
 
 MCP2515 mcp2515(10);
+DFRobotDFPlayerMini dfPlayer;
+bool dfPlayerReady = false;
 
-// RGB LED PINS (Common Anode)
-const int redPin   = 6;
-const int greenPin = 5;
-const int bluePin  = 4;
+// RGB LED pins (Common Cathode: HIGH = on)
+const int redPin   = 6;   // PWM
+const int greenPin = 5;   // PWM
+const int bluePin  = 4;   // digital only (no PWM on Uno pin 4)
 
+// DRV8871 motor driver pins (propeller hat)
+const int motorIN1 = A0;  // direction pin (held LOW for forward)
+const int motorIN2 = 9;   // PWM speed pin
+
+
+// LED COLOR
+// Red and green use analogWrite for brightness control
+// Blue uses digitalWrite (on/off only, pin 4 has no PWM)
 void setColor(int r, int g, int b) {
-  analogWrite(redPin,   255 - r);
-  analogWrite(greenPin, 255 - g);
-  analogWrite(bluePin,  255 - b);
+  analogWrite(redPin,   r);
+  analogWrite(greenPin, g);
+  digitalWrite(bluePin, (b > 127) ? HIGH : LOW);
 }
 
-// CONTROL MODES
+
+// CAN CONTROL MODES
 enum control_mode {
   Duty_Cycle_Set     = 0x2050080,
   Speed_Set          = 0x2050480,
@@ -29,7 +55,7 @@ enum control_mode {
   Smart_Motion_Set   = 0x2051480
 };
 
-// STATUS FRAME IDs
+// CAN STATUS FRAME IDs
 enum status_frame_id {
   status_0 = 0x2051800,
   status_1 = 0x2051840,
@@ -38,14 +64,14 @@ enum status_frame_id {
   status_4 = 0x2051900
 };
 
-// HEARTBEAT
+// CAN HEARTBEAT
 const uint32_t HEARTBEAT_ID = 0x2052C80;
 const uint8_t  HEARTBEAT_DATA[8] = {255,255,255,255,255,255,255,255};
 
 struct can_frame heartbeat_frame;
 struct can_frame control_frame;
-
 const uint8_t CONTROL_SIZE = 8;
+
 
 // DRIVING CONSTANTS
 const float MAX_DUTY        = 0.3f;
@@ -54,13 +80,13 @@ const float RESPONSE        = 2.0f;
 const float RAMP_RATE_ACCEL = 0.002f;
 const float RAMP_RATE_DECEL = 0.002f;
 
-// MOTOR STATE
-float duty_left_target  = 0.0f;
-float duty_right_target = 0.0f;
+// MOTOR STATE (drive motors)
+float duty_left_target   = 0.0f;
+float duty_right_target  = 0.0f;
 float duty_left_current  = 0.0f;
 float duty_right_current = 0.0f;
 
-// ENCODER / SENSOR STATE
+// SENSOR STATE
 float   velocity_left  = 0.0f;
 float   velocity_right = 0.0f;
 float   position_left  = 0.0f;
@@ -72,12 +98,83 @@ uint8_t temp_right     = 0;
 float   voltage        = 0.0f;
 float   battery_pct    = 0.0f;
 
-// Rolling average for voltage
+// Voltage rolling average
 static constexpr int VOLTAGE_SAMPLES = 20;
 float voltage_buf[VOLTAGE_SAMPLES] = {};
-int   voltage_idx                  = 0;
-bool  voltage_buf_full             = false;
+int   voltage_idx      = 0;
+bool  voltage_buf_full = false;
 
+// CONTROLLER DATA
+struct ControllerData {
+  int lx, ly, rx, ry;
+  int brake, throttle;
+  int buttons, dpad;
+};
+ControllerData controller;
+
+char buffer[64];
+uint8_t bufIdx = 0;
+
+// BUTTON BIT MASKS (Bluepad32)
+const int BTN_A  = (1 << 0);
+const int BTN_B  = (1 << 1);
+const int BTN_X  = (1 << 2);
+const int BTN_Y  = (1 << 3);
+const int BTN_LB = (1 << 4);
+const int BTN_RB = (1 << 5);
+const int BTN_LS = (1 << 8);
+const int BTN_RS = (1 << 9);
+
+// DPAD BITMASK VALUES (Bluepad32)
+const int DPAD_UP    = 0x01;
+const int DPAD_DOWN  = 0x02;
+const int DPAD_RIGHT = 0x04;
+const int DPAD_LEFT  = 0x08;
+
+// LED STATE
+int led_r = 0, led_g = 0, led_b = 0;
+bool rainbow_mode = false;
+float rainbow_hue = 0.0f;
+
+// SOUND STATE
+int current_track  = 1;
+const int MAX_TRACKS = 9;
+bool sound_playing = false;
+
+// SERIAL RX COUNTER (for debugging)
+unsigned long rxByteCount = 0;
+unsigned long rxParseCount = 0;
+
+// DEBUG
+static bool DEBUG_RAW_BYTES = false;
+
+
+// FORWARD DECLARATIONS
+float addVoltageSample(float v);
+float batteryPercent(float v);
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b);
+void handleLEDButtons(int buttons);
+void updateRainbow();
+void speakerSetup();
+void playTrack(int track);
+void stopSound();
+void handleSoundDpad(int dpad);
+void propellerSetup();
+void updatePropeller(int triggerValue);
+bool parseCSV(char* line, ControllerData& c);
+float applyDeadzone(float v);
+float applyCurve(float v);
+void computeMotorFromStick();
+void updateMotorRamp();
+void packData(can_frame &frame, const uint8_t *data, const int size);
+void createData(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size);
+void sendControlFrame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint);
+void drainCANStatus();
+void printRawBytes(const char* label, const struct can_frame& frame);
+void printStatus();
+
+
+// VOLTAGE AVERAGING
 float addVoltageSample(float v) {
   voltage_buf[voltage_idx] = v;
   voltage_idx = (voltage_idx + 1) % VOLTAGE_SAMPLES;
@@ -88,40 +185,16 @@ float addVoltageSample(float v) {
   return sum / count;
 }
 
-static bool DEBUG_RAW_BYTES = false;
+// BATTERY PERCENTAGE (3S LiPo)
+float batteryPercent(float v) {
+  const float max_v = 12.6f;
+  const float min_v = 10.5f;
+  float pct = (v - min_v) / (max_v - min_v) * 100.0f;
+  return constrain(pct, 0.0f, 100.0f);
+}
 
-// SERIAL PARSER
-struct ControllerData {
-  int lx, ly, rx, ry;
-  int brake;
-  int throttle;
-  int buttons;
-  int dpad;
-};
 
-ControllerData controller;
-
-char buffer[64];
-uint8_t bufIdx = 0;
-
-// BUTTON BIT MASKS
-const int BTN_A    = (1 << 0);
-const int BTN_B    = (1 << 1);
-const int BTN_X    = (1 << 2);
-const int BTN_Y    = (1 << 3);
-const int BTN_LB   = (1 << 4);
-const int BTN_RB   = (1 << 5);
-const int BTN_LS   = (1 << 8);
-const int BTN_RS   = (1 << 9);
-
-// LED STATE
-int led_r = 0, led_g = 0, led_b = 0;
-
-// RAINBOW STATE
-bool rainbow_mode = false;
-float rainbow_hue = 0.0f;
-
-// HSV to RGB helper
+// HSV TO RGB
 void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
   float c = v * s;
   float x = c * (1.0f - fabs(fmod(h / 60.0f, 2.0f) - 1.0f));
@@ -138,28 +211,124 @@ void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
   b = (int)((b1 + m) * 255);
 }
 
+
+// LED: set color from controller buttons
+// A = green, B = red, X = blue, Y = yellow
+// LS (left stick click) = purple, RS (right stick click) = white
 void handleLEDButtons(int buttons) {
-  if      (buttons & BTN_A)  { rainbow_mode = false; led_r =   0; led_g = 255; led_b =   0; }
-  else if (buttons & BTN_B)  { rainbow_mode = false; led_r = 255; led_g =   0; led_b =   0; }
-  else if (buttons & BTN_Y)  { rainbow_mode = false; led_r = 255; led_g = 180; led_b =   0; }
-  else if (buttons & BTN_X)  { rainbow_mode = false; led_r =   0; led_g =   0; led_b = 255; }
-  else if (buttons & BTN_LB) { rainbow_mode = false; led_r = 148; led_g =   0; led_b = 211; }
-  else if (buttons & BTN_RB) { rainbow_mode = false; led_r = 255; led_g = 255; led_b = 255; }
+  if      (buttons & BTN_A)  { rainbow_mode = false; led_r =   0; led_g = 255; led_b =   0; } // green
+  else if (buttons & BTN_B)  { rainbow_mode = false; led_r = 255; led_g =   0; led_b =   0; } // red
+  else if (buttons & BTN_X)  { rainbow_mode = false; led_r =   0; led_g =   0; led_b = 255; } // blue
+  else if (buttons & BTN_Y)  { rainbow_mode = false; led_r = 255; led_g = 180; led_b =   0; } // yellow
+  else if (buttons & BTN_LS) { rainbow_mode = false; led_r = 148; led_g =   0; led_b = 211; } // purple
+  else if (buttons & BTN_RS) { rainbow_mode = false; led_r = 255; led_g = 255; led_b = 255; } // white
 
   if (!rainbow_mode) setColor(led_r, led_g, led_b);
 }
 
-// BATTERY PERCENTAGE
-float batteryPercent(float v) {
-  const float max_v = 12.6f;
-  const float min_v = 10.5f;
-  float pct = (v - min_v) / (max_v - min_v) * 100.0f;
-  if (pct > 100.0f) pct = 100.0f;
-  if (pct <   0.0f) pct =   0.0f;
-  return pct;
+// LED: advance rainbow cycle (call periodically)
+void updateRainbow() {
+  rainbow_hue += 4.0f;
+  if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
+  int r, g, b;
+  hsvToRgb(rainbow_hue, 1.0f, 1.0f, r, g, b);
+  setColor(r, g, b);
 }
 
-// CSV PARSER
+
+// SPEAKER: initialize DFPlayer
+void speakerSetup() {
+  dfPlayerSerial.begin(9600);
+  dfPlayerSerial.listen();
+  Serial.println("Initializing DFPlayer...");
+  delay(2000);
+  if (!dfPlayer.begin(dfPlayerSerial, false, false)) {
+    Serial.println("DFPlayer ERROR: check wiring and SD card");
+    dfPlayerReady = false;
+    controllerSerial.listen();
+    return;
+  }
+  Serial.println("DFPlayer ready");
+  dfPlayer.volume(30);
+  dfPlayerReady = true;
+  controllerSerial.listen();
+}
+
+// SPEAKER: play a specific track number
+void playTrack(int track) {
+  if (!dfPlayerReady) return;
+  Serial.print("Playing track: ");
+  Serial.println(track);
+  dfPlayerSerial.listen();
+  dfPlayer.play(track);
+  controllerSerial.listen();
+  sound_playing = true;
+}
+
+// SPEAKER: stop playback
+void stopSound() {
+  if (!dfPlayerReady) return;
+  Serial.println("Stopping audio");
+  dfPlayerSerial.listen();
+  dfPlayer.pause();
+  controllerSerial.listen();
+  sound_playing = false;
+}
+
+// SPEAKER: handle dpad input for sound selection
+//   UP    = play current track
+//   DOWN  = stop
+//   RIGHT = next track and play
+//   LEFT  = previous track and play
+void handleSoundDpad(int dpad) {
+  static int prev_dpad = 0;
+
+  if (dpad == prev_dpad) return;
+  prev_dpad = dpad;
+
+  if (dpad & DPAD_RIGHT) {
+    current_track++;
+    if (current_track > MAX_TRACKS) current_track = 1;
+    Serial.print("Selected track: ");
+    Serial.println(current_track);
+    playTrack(current_track);
+  }
+  else if (dpad & DPAD_LEFT) {
+    current_track--;
+    if (current_track < 1) current_track = MAX_TRACKS;
+    Serial.print("Selected track: ");
+    Serial.println(current_track);
+    playTrack(current_track);
+  }
+  else if (dpad & DPAD_UP) {
+    playTrack(current_track);
+  }
+  else if (dpad & DPAD_DOWN) {
+    stopSound();
+  }
+}
+
+
+// PROPELLER: initialize DRV8871 pins
+void propellerSetup() {
+  pinMode(motorIN1, OUTPUT);
+  pinMode(motorIN2, OUTPUT);
+  digitalWrite(motorIN1, LOW);
+  analogWrite(motorIN2, 0);
+  Serial.println("Propeller motor ready");
+}
+
+// PROPELLER: set speed from left trigger (0-1023 analog input)
+// Maps LT analog value to 0-128 PWM (capped at 50% for 12V battery)
+void updatePropeller(int triggerValue) {
+  int speed = map(triggerValue, 0, 1023, 0, 128);
+  if (speed < 10) speed = 0;  // small deadzone to prevent creep
+  digitalWrite(motorIN1, LOW);
+  analogWrite(motorIN2, speed);
+}
+
+
+// CSV PARSER: "lx,ly,rx,ry,brake,throttle,buttons,dpad"
 bool parseCSV(char* line, ControllerData& c) {
   int fields[8];
   int count = 0;
@@ -180,99 +349,109 @@ bool parseCSV(char* line, ControllerData& c) {
   return true;
 }
 
-// DEADZONE
+
+// DRIVING: apply deadzone to a -1..1 value
 float applyDeadzone(float v) {
   if (fabs(v) < DEADZONE) return 0;
   if (v > 0) return (v - DEADZONE) / (1.0f - DEADZONE);
   else       return (v + DEADZONE) / (1.0f - DEADZONE);
 }
 
-// RESPONSE CURVE
+// DRIVING: apply exponential response curve
 float applyCurve(float v) {
   float sign = (v >= 0) ? 1.0f : -1.0f;
   return pow(fabs(v), RESPONSE) * sign;
 }
 
-// MOTOR DRIVE
-// Left stick up/down (ly):     up = forward, down = backward
-// Right stick left/right (rx): right = turn right, left = turn left
+// DRIVING: compute left/right duty from stick input
+// Left stick Y = throttle (up = forward)
+// Right stick X = steering (right = turn right)
 void computeMotorFromStick() {
-  float y =  controller.rx / 512.0f;   // throttle
-  float x = -controller.ly / 512.0f;   // steering
-  x = applyDeadzone(x);
-  y = applyDeadzone(y);
-  x = applyCurve(x);
-  y = applyCurve(y);
-  float left  = y + x;
-  float right = y - x;
+  float throttle =  controller.rx / 512.0f;
+  float steering = -controller.ly / 512.0f;
+  throttle = applyCurve(applyDeadzone(throttle));
+  steering = applyCurve(applyDeadzone(steering));
+  float left  = throttle + steering;
+  float right = throttle - steering;
   float maxVal = max(fabs(left), fabs(right));
-  if (maxVal > 1.0f) {
-    left  /= maxVal;
-    right /= maxVal;
-  }
+  if (maxVal > 1.0f) { left /= maxVal; right /= maxVal; }
   duty_left_target  = left  * MAX_DUTY;
   duty_right_target = right * MAX_DUTY;
 }
 
-// MOTOR RAMPING
+// DRIVING: smooth ramp toward target duty
 void updateMotorRamp() {
   auto rampAxis = [](float current, float target) -> float {
     bool decelerating = fabs(target) < fabs(current);
     float rate = decelerating ? RAMP_RATE_DECEL : RAMP_RATE_ACCEL;
-    if (current < target) {
-      current += rate;
-      if (current > target) current = target;
-    } else if (current > target) {
-      current -= rate;
-      if (current < target) current = target;
-    }
+    if      (current < target) { current += rate; if (current > target) current = target; }
+    else if (current > target) { current -= rate; if (current < target) current = target; }
     return current;
   };
   duty_left_current  = rampAxis(duty_left_current,  duty_left_target);
   duty_right_current = rampAxis(duty_right_current, duty_right_target);
 }
 
-// SERIAL PRINT
-void printStatus() {
-  Serial.print("LY=");       Serial.print(controller.ly);
-  Serial.print(" RX=");      Serial.print(controller.rx);
-  Serial.print(" | Target L="); Serial.print(duty_left_target);
-  Serial.print(" R=");       Serial.print(duty_right_target);
-  Serial.print(" | RPM L="); Serial.print(velocity_left);
-  Serial.print(" R=");       Serial.print(velocity_right);
-  Serial.print(" | Pos L="); Serial.print(position_left);
-  Serial.print(" R=");       Serial.print(position_right);
-  Serial.print(" | Temp L="); Serial.print(temp_left);
-  Serial.print("C R=");      Serial.print(temp_right);
-  Serial.print("C | mA L="); Serial.print(current_left);
-  Serial.print(" R=");       Serial.print(current_right);
-  Serial.print(" | Volts="); Serial.print(voltage);
-  Serial.print(" | Batt=");  Serial.print(battery_pct);
-  Serial.println("%");
+
+// CAN: pack bytes into a frame
+void packData(can_frame &frame, const uint8_t *data, const int size) {
+  for (int i = 0; i < size; i++) frame.data[i] = data[i];
 }
 
-// CAN HELPERS
-void pack_data(can_frame &frame, const uint8_t *data, const int size) {
-  for (int i = 0; i < size; i++)
-    frame.data[i] = data[i];
+// CAN: create data array from a value (pads remaining bytes with 0)
+void createData(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size) {
+  const byte* src = static_cast<const byte*>(data);
+  for (int i = 0; i < data_size; i++)  frame_data[i] = src[i];
+  for (int i = data_size; i < total_size; i++) frame_data[i] = 0;
 }
 
-void create_data(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size) {
-  const byte* data_arr = static_cast<const byte*>(data);
-  for (int i = 0; i < data_size; i++)
-    frame_data[i] = data_arr[i];
-  for (int i = data_size; i < total_size; i++)
-    frame_data[i] = 0;
-}
-
-void send_control_frame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint) {
+// CAN: send a motor control frame
+void sendControlFrame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint) {
   control_frame.can_id = (mode + device_id) | CAN_EFF_FLAG;
-  byte control_data[CONTROL_SIZE];
-  create_data(&setpoint, control_data, 4, CONTROL_SIZE);
-  pack_data(control_frame, control_data, CONTROL_SIZE);
+  byte data[CONTROL_SIZE];
+  createData(&setpoint, data, 4, CONTROL_SIZE);
+  packData(control_frame, data, CONTROL_SIZE);
   mcp2515.sendMessage(txb, &control_frame);
 }
 
+// CAN: read all pending status frames from motor controllers
+void drainCANStatus() {
+  struct can_frame rx;
+  while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
+    uint32_t id = rx.can_id & ~CAN_EFF_FLAG;
+
+    if (id == (status_1 + 1)) {
+      memcpy(&velocity_left, rx.data, 4);
+      temp_left = rx.data[4];
+      float raw_i = rx.data[6] * 0.125f;
+      if (raw_i < 40.0f) current_left = raw_i;
+      float new_v = rx.data[5] * 0.0658f;
+      if (new_v >= 10.0f) {
+        voltage = addVoltageSample(new_v);
+        bool idle = fabs(duty_left_current) < 0.05f && fabs(duty_right_current) < 0.05f;
+        if (idle) battery_pct = batteryPercent(voltage);
+      }
+      if (DEBUG_RAW_BYTES) printRawBytes("S1_L", rx);
+    }
+    else if (id == (status_1 + 2)) {
+      memcpy(&velocity_right, rx.data, 4);
+      temp_right = rx.data[4];
+      float raw_i = rx.data[6] * 0.125f;
+      if (raw_i < 40.0f) current_right = raw_i;
+      if (DEBUG_RAW_BYTES) printRawBytes("S1_R", rx);
+    }
+    else if (id == (status_2 + 1)) {
+      memcpy(&position_left, rx.data, 4);
+      if (DEBUG_RAW_BYTES) printRawBytes("S2_L", rx);
+    }
+    else if (id == (status_2 + 2)) {
+      memcpy(&position_right, rx.data, 4);
+      if (DEBUG_RAW_BYTES) printRawBytes("S2_R", rx);
+    }
+  }
+}
+
+// DEBUG: print raw CAN frame bytes
 void printRawBytes(const char* label, const struct can_frame& frame) {
   Serial.print(label);
   Serial.print(" RAW [hex]: ");
@@ -289,76 +468,96 @@ void printRawBytes(const char* label, const struct can_frame& frame) {
   Serial.println();
 }
 
+// DEBUG: print telemetry to serial monitor
+void printStatus() {
+  Serial.print("LY=");       Serial.print(controller.ly);
+  Serial.print(" RX=");      Serial.print(controller.rx);
+  Serial.print(" | Target L="); Serial.print(duty_left_target);
+  Serial.print(" R=");       Serial.print(duty_right_target);
+  Serial.print(" | RPM L="); Serial.print(velocity_left);
+  Serial.print(" R=");       Serial.print(velocity_right);
+  Serial.print(" | Temp L="); Serial.print(temp_left);
+  Serial.print("C R=");      Serial.print(temp_right);
+  Serial.print("C | Volts="); Serial.print(voltage);
+  Serial.print(" | Batt=");  Serial.print(battery_pct);
+  Serial.print("% | Track="); Serial.print(current_track);
+  Serial.print(" | Prop=");  Serial.print(controller.brake);
+  Serial.print(" | RX=");    Serial.print(rxByteCount);
+  Serial.print("/");          Serial.println(rxParseCount);
+}
+
+
 // SETUP
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(9600);
-  Serial.println("CAN CONTROLLER READY");
 
+  // LED (set off immediately)
   pinMode(redPin,   OUTPUT);
   pinMode(greenPin, OUTPUT);
   pinMode(bluePin,  OUTPUT);
   setColor(0, 0, 0);
 
+  // CAN bus
   heartbeat_frame.can_id  = HEARTBEAT_ID | CAN_EFF_FLAG;
   heartbeat_frame.can_dlc = 8;
-  pack_data(heartbeat_frame, HEARTBEAT_DATA, 8);
+  packData(heartbeat_frame, HEARTBEAT_DATA, 8);
   control_frame.can_dlc = 8;
-
   mcp2515.reset();
   mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ);
   mcp2515.setNormalMode();
+
+  // Speaker
+  speakerSetup();
+
+  // Propeller motor
+  propellerSetup();
+
+  // Controller serial (must start AFTER speaker init)
+  controllerSerial.begin(9600);
+  controllerSerial.listen();
+
+  Serial.println("ROBOGOOSE READY");
+  Serial.println("Build: v7-propeller");
+  Serial.print("Free RAM: ");
+  extern int __heap_start, *__brkval;
+  int v;
+  Serial.println((int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval));
+  Serial.print("DFPlayer: ");
+  Serial.println(dfPlayerReady ? "OK" : "FAIL");
+  Serial.print("Controller listening on pin 3: ");
+  Serial.println(controllerSerial.isListening() ? "YES" : "NO");
 }
 
-// LOOP
+
+// MAIN LOOP
 void loop() {
 
-  // DRAIN RX FIRST — prevents status frame backlog from delaying control sends
-  struct can_frame rx;
-  while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
+  // Read all pending CAN status frames
+  drainCANStatus();
 
-    uint32_t id = rx.can_id & ~CAN_EFF_FLAG;
-
-    if (id == (status_1 + 1)) {
-      memcpy(&velocity_left, rx.data, 4);
-      temp_left = rx.data[4];
-      float raw_current_l = rx.data[6] * 0.125f;
-      current_left = (raw_current_l < 40.0f) ? raw_current_l : current_left;
-      float new_voltage = rx.data[5] * 0.0658f;
-      if (new_voltage >= 10.0f) {
-        voltage = addVoltageSample(new_voltage);
-        bool motors_idle = fabs(duty_left_current) < 0.05f && fabs(duty_right_current) < 0.05f;
-        if (motors_idle) battery_pct = batteryPercent(voltage);
-      }
-      if (DEBUG_RAW_BYTES) printRawBytes("S1_L", rx);
-    }
-    else if (id == (status_1 + 2)) {
-      memcpy(&velocity_right, rx.data, 4);
-      temp_right = rx.data[4];
-      float raw_current_r = rx.data[6] * 0.125f;
-      current_right = (raw_current_r < 40.0f) ? raw_current_r : current_right;
-      if (DEBUG_RAW_BYTES) printRawBytes("S1_R", rx);
-    }
-    else if (id == (status_2 + 1)) {
-      memcpy(&position_left, rx.data, 4);
-      if (DEBUG_RAW_BYTES) printRawBytes("S2_L", rx);
-    }
-    else if (id == (status_2 + 2)) {
-      memcpy(&position_right, rx.data, 4);
-      if (DEBUG_RAW_BYTES) printRawBytes("S2_R", rx);
-    }
-  }
-
-  // READ CONTROLLER DATA
-  while (Serial1.available()) {
-    char c = Serial1.read();
+  // Read controller data from Nano
+  while (controllerSerial.available()) {
+    char c = controllerSerial.read();
+    rxByteCount++;
     if (c == '\n') {
       buffer[bufIdx] = '\0';
       if (bufIdx > 0 && parseCSV(buffer, controller)) {
+        rxParseCount++;
+        // Driving
         computeMotorFromStick();
+
+        // LED colors via face buttons and stick clicks
         handleLEDButtons(controller.buttons);
-        if      (controller.brake    > 10) { rainbow_mode = false; led_r = 0; led_g = 0; led_b = 0; setColor(0, 0, 0); }
-        else if (controller.throttle > 10) { rainbow_mode = true; }
+
+        // LB = LEDs off, RB = rainbow mode
+        if      (controller.buttons & BTN_LB) { rainbow_mode = false; led_r = 0; led_g = 0; led_b = 0; setColor(0, 0, 0); }
+        else if (controller.buttons & BTN_RB) { rainbow_mode = true; }
+
+        // Sound selection via dpad
+        handleSoundDpad(controller.dpad);
+
+        // Propeller speed via left trigger (brake = LT analog 0-1023)
+        updatePropeller(controller.brake);
       }
       bufIdx = 0;
     } else if (c != '\r' && bufIdx < sizeof(buffer) - 1) {
@@ -370,46 +569,42 @@ void loop() {
 
   unsigned long now = millis();
 
-  // RAINBOW UPDATE every 20ms
+  // Rainbow LED update (every 20ms)
   static unsigned long rainbow_last = 0;
   if (rainbow_mode && now - rainbow_last >= 20) {
-    rainbow_hue += 4.0f;
-    if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
-    int r, g, b;
-    hsvToRgb(rainbow_hue, 1.0f, 1.0f, r, g, b);
-    setColor(r, g, b);
+    updateRainbow();
     rainbow_last = now;
   }
 
-  // RAMP MOTORS every 1ms
+  // Motor ramp (every 1ms)
   static unsigned long ramp_last = 0;
   if (now - ramp_last >= 1) {
     updateMotorRamp();
     ramp_last = now;
   }
 
-  // HEARTBEAT every 10ms
+  // CAN heartbeat (every 10ms)
   static unsigned long hb_last = 0;
   if (now - hb_last >= 10) {
     mcp2515.sendMessage(MCP2515::TXB0, &heartbeat_frame);
     hb_last = now;
   }
 
-  // LEFT MOTOR every 10ms
+  // Left motor command (every 10ms)
   static unsigned long ctrl_left_last = 5;
   if (now - ctrl_left_last >= 10) {
-    send_control_frame(MCP2515::TXB1, 1, Duty_Cycle_Set, duty_left_current);
+    sendControlFrame(MCP2515::TXB1, 1, Duty_Cycle_Set, duty_left_current);
     ctrl_left_last = now;
   }
 
-  // RIGHT MOTOR every 10ms, offset by 5ms from left
+  // Right motor command (every 10ms, offset 5ms from left)
   static unsigned long ctrl_right_last = 10;
   if (now - ctrl_right_last >= 10) {
-    send_control_frame(MCP2515::TXB2, 2, Duty_Cycle_Set, duty_right_current);
+    sendControlFrame(MCP2515::TXB2, 2, Duty_Cycle_Set, duty_right_current);
     ctrl_right_last = now;
   }
 
-  // SERIAL PRINT every 100ms
+  // Serial telemetry (every 100ms)
   static unsigned long print_last = 0;
   if (now - print_last >= 100) {
     printStatus();
