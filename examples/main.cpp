@@ -1,335 +1,613 @@
-/**
- * CanControl example - William Guimont-Martin 2025-2026 (https://github.com/willGuimont/CanControl)
- * Example showing how to setup and use FRC CAN motors using Arduino chips.
- *
- * See README.md for wiring.
- */
-#include "CanControl.h"
-
+#include <Arduino.h>
 #include <SPI.h>
 #include <mcp2515.h>
+#include <SoftwareSerial.h>
+#include <math.h>
+#include "DFRobotDFPlayerMini.h"
 
-using namespace CanControl;
+// PIN ASSIGNMENTS
+// 2       = CAN INT
+// 3       = Controller serial RX (from Nano)
+// 4       = Blue LED (digital on/off, no PWM on this pin)
+// 5       = Green LED (PWM)
+// 6       = Red LED (PWM)
+// 7       = DFPlayer RX (from player)
+// 8       = DFPlayer TX (to player)
+// 9       = DRV8871 IN2 (PWM speed control)
+// 10..13  = SPI for MCP2515 CAN
+// A0      = DRV8871 IN1 (direction, digital only)
 
-// Configuration for the FRC can protocol
-static constexpr CAN_SPEED MCP2515_SPEED = CAN_1000KBPS;
-// Check the oscillator on your MCP2515
-static constexpr CAN_CLOCK MCP2515_OSC = MCP_8MHZ;
-// With an 8 MHz MCP2515 oscillator the SPI SCK must be kept below.
-// Use 10 MHz only when the MCP2515 module has a 16/20 MHz oscillator.
-static constexpr uint32_t SPI_CLOCK_SPEED = (MCP2515_OSC == MCP_8MHZ) ? 4000000UL : 10000000UL;
+SoftwareSerial controllerSerial(3, -1);  // RX only from Nano
+SoftwareSerial dfPlayerSerial(7, 8);     // RX, TX for DFPlayer Mini
 
-// Prevent accidental misconfiguration at compile-time
-static_assert(!(MCP2515_OSC == MCP_8MHZ && SPI_CLOCK_SPEED > 4000000UL),
-              "SPI_CLOCK_SPEED too high for MCP_8MHZ; must be <= 4000000UL");
+MCP2515 mcp2515(10);
+DFRobotDFPlayerMini dfPlayer;
+bool dfPlayerReady = false;
 
-// The Chip Select (CS) pin varies depending on the board used. See README.md for wiring.
-// Homing state: when true we drive positively until the forward hard limit is seen
-static bool            homing_active     = false;
-static bool            homing_prev_limit = false;
-static constexpr float homing_speed      = 0.20f;
-#ifndef MCP2515_CS_PIN
-#if defined(ARDUINO_AVR_MEGA2560) || defined(__AVR_ATmega2560__) || defined(ARDUINO_AVR_MEGA)
-static constexpr uint8_t MCP2515_CS_PIN = 53;
-#elif defined(ARDUINO_AVR_UNO) || defined(__AVR_ATmega328P__) || defined(ARDUINO_AVR_NANO)
-static constexpr uint8_t MCP2515_CS_PIN = 10;
-#else
-#warning "Unknown board: defaulting MCP2515_CS_PIN to 10. Define MCP2515_CS_PIN via build_flags to override."
-static constexpr uint8_t MCP2515_CS_PIN = 10;
-#endif
-#else
-// MCP2515_CS_PIN provided by build system
-static constexpr uint8_t MCP2515_CS_PIN = MCP2515_CS_PIN;
-#endif
+// RGB LED pins (Common Cathode: HIGH = on)
+const int redPin   = 6;   // PWM
+const int greenPin = 5;   // PWM
+const int bluePin  = 4;   // digital only (no PWM on Uno pin 4)
 
-// Controller to the MCP2515 chip, be sure to specify the correct CS pin
-static MCP2515 mcp2515(MCP2515_CS_PIN, SPI_CLOCK_SPEED);
+// DRV8871 motor driver pins (propeller hat)
+const int motorIN1 = A0;  // direction pin (held LOW for forward)
+const int motorIN2 = 9;   // PWM speed pin
 
-// Creating the motor, specify the device ID set in the REV Hardware Client
-static constexpr uint8_t spark_motor_id = 1;
-static SparkMax          spark(mcp2515, spark_motor_id);
-// Same for TalonSRX
-// static constexpr uint8_t talon_motor_id = 30;
-// static TalonSrx     talon(mcp2515, talon_motor_id);
 
-// PID constants to show how to set parameters on SparkMax
-static constexpr float spark_p = 0.1;
-static constexpr float spark_i = 0.0;
-static constexpr float spark_d = 0.0;
-static constexpr float spark_f = 0.0;
-
-// Utility to show MCP2515 errors as strings
-static const String mcpErrorToString(MCP2515::ERROR e)
-{
-    switch (e)
-    {
-    case MCP2515::ERROR_OK:
-        return "OK";
-    case MCP2515::ERROR_FAIL:
-        return "ERROR_FAIL";
-    case MCP2515::ERROR_ALLTXBUSY:
-        return "ERROR_ALLTXBUSY";
-    case MCP2515::ERROR_FAILINIT:
-        return "ERROR_FAILINIT";
-    case MCP2515::ERROR_FAILTX:
-        return "ERROR_FAILTX";
-    case MCP2515::ERROR_NOMSG:
-        return "ERROR_NOMSG";
-    default:
-        return "ERROR_UNKNOWN";
-    }
+// LED COLOR
+// Red and green use analogWrite for brightness control
+// Blue uses digitalWrite (on/off only, pin 4 has no PWM)
+void setColor(int r, int g, int b) {
+  analogWrite(redPin,   r);
+  analogWrite(greenPin, g);
+  digitalWrite(bluePin, (b > 127) ? HIGH : LOW);
 }
 
-// You need to send a heartbeat periodically for the motors to be enabled.
-// This mirrors the frame the RoboRIO would send.
-// See https://docs.wpilib.org/en/stable/docs/software/can-devices/can-addressing.html#universal-heartbeat for more
-// details.
-// Heartbeat must be sent quickly enough to avoid the motor to stop, but not too quickly for the MCP2515's buffers
-// filled
-static constexpr unsigned long heartbeat_interval_ms = 19;
-// Sending updates to the motor can be done less frequently. For SparkMax, a command can be sent only once and it will
-// continue at that speed as long as the heartbeat is present
-static constexpr unsigned long update_interval_ms = 5;
 
-// Create a default robot state
-// The important part is that the robot state has the `enabled` and `systemWatchdog` fields set to `true`
-static const heartbeat::RobotState robot_state = default_heartbeat();
-
-// Information about the small serial interface used to control the motor
-void print_help()
-{
-    Serial.println("Available commands: ");
-    Serial.println("\t- Start with `s` to set speed (float)");
-    Serial.println("\t- Start with `p` to set position (float)");
-    Serial.println("\t- `z` to start homing (drive positive until forward limit), `c` to cancel");
-    Serial.println("\t- `h` for help");
-    Serial.println("Ready to accept commands...");
-    Serial.println();
-}
-
-enum CommandMode
-{
-    Speed,
-    Position,
+// CAN CONTROL MODES
+enum control_mode {
+  Duty_Cycle_Set     = 0x2050080,
+  Speed_Set          = 0x2050480,
+  Smart_Velocity_Set = 0x20504C0,
+  Position_Set       = 0x2050C80,
+  Voltage_Set        = 0x2051080,
+  Current_Set        = 0x20510C0,
+  Smart_Motion_Set   = 0x2051480
 };
 
-void setup()
-{
+// CAN STATUS FRAME IDs
+enum status_frame_id {
+  status_0 = 0x2051800,
+  status_1 = 0x2051840,
+  status_2 = 0x2051880,
+  status_3 = 0x20518C0,
+  status_4 = 0x2051900
+};
 
-    // Initialize serial
-    Serial.begin(115200);
-    while (!Serial)
-        ;
+// CAN HEARTBEAT
+const uint32_t HEARTBEAT_ID = 0x2052C80;
+const uint8_t  HEARTBEAT_DATA[8] = {255,255,255,255,255,255,255,255};
 
-    // Initialize MCP2515
-    {
-        Serial.print("Starting CanControl on pin ");
-        Serial.println(MCP2515_CS_PIN);
-        Serial.print("MCP2515 oscillator: ");
-        if (MCP2515_OSC == MCP_8MHZ)
-        {
-            Serial.println("8 MHz");
-        }
-        else if (MCP2515_OSC == MCP_16MHZ)
-        {
-            Serial.println("16 MHz");
-        }
-        else if (MCP2515_OSC == MCP_20MHZ)
-        {
-            Serial.println("20 MHz");
-        }
-        else
-        {
-            Serial.println("unknown");
-        }
-        Serial.print("SPI clock (Hz): ");
-        Serial.println(SPI_CLOCK_SPEED);
+struct can_frame heartbeat_frame;
+struct can_frame control_frame;
+const uint8_t CONTROL_SIZE = 8;
 
-        // Must reset before use
-        MCP2515::ERROR setupErr;
-        setupErr = mcp2515.reset();
-        delay(10);
-        Serial.print("MCP2515 reset: ");
-        Serial.println(mcpErrorToString(setupErr));
 
-        // Set speed
-        setupErr = mcp2515.setBitrate(MCP2515_SPEED, MCP2515_OSC);
-        delay(10);
-        Serial.print("MCP2515 setBitrate: ");
-        Serial.println(mcpErrorToString(setupErr));
-        Serial.println();
+// DRIVING CONSTANTS
+const float MAX_DUTY        = 0.3f;
+const float DEADZONE        = 0.15f;
+const float RESPONSE        = 2.0f;
+const float RAMP_RATE_ACCEL = 0.002f;
+const float RAMP_RATE_DECEL = 0.002f;
 
-        // Necessary for the mcp2515 to not wait for an ACK
-        setupErr = mcp2515.setNormalOneShotMode();
-        delay(10);
-        Serial.print("MCP2515 setNormalOneShotMode: ");
-        Serial.println(mcpErrorToString(setupErr));
-        Serial.println();
+// MOTOR STATE (drive motors)
+float duty_left_target   = 0.0f;
+float duty_right_target  = 0.0f;
+float duty_left_current  = 0.0f;
+float duty_right_current = 0.0f;
 
-        // Best practice, reset motor parameter to avoid lingering configs that might behave unexpectly
-        // Set the parameters when initializing the motor
-        Serial.println("Resetting all motor parameters");
-        MCP2515::ERROR reset_err = spark.reset_safe_parameters();
-        delay(10);
-        Serial.print("SparkMax reset_safe_parameters: ");
-        Serial.println(mcpErrorToString(reset_err));
-        Serial.println();
+// SENSOR STATE
+float   velocity_left  = 0.0f;
+float   velocity_right = 0.0f;
+float   position_left  = 0.0f;
+float   position_right = 0.0f;
+float   current_left   = 0.0f;
+float   current_right  = 0.0f;
+uint8_t temp_left      = 0;
+uint8_t temp_right     = 0;
+float   voltage        = 0.0f;
+float   battery_pct    = 0.0f;
 
-        // Set motor PID parameter for position control mode
-        Serial.println("Setting PID parameters");
-        int pid_err = spark.set_pid_p(spark_p);
-        pid_err |= spark.set_pid_i(spark_i);
-        delay(10);
-        pid_err |= spark.set_pid_d(spark_d);
-        delay(10);
-        pid_err |= spark.set_pid_f(spark_f);
-        delay(10);
-        if (pid_err != MCP2515::ERROR_OK)
-        {
-            Serial.println("Error setting PID parameters");
-        }
-        else
-        {
-            Serial.println("PID parameters set");
-        }
-    }
+// Voltage rolling average
+static constexpr int VOLTAGE_SAMPLES = 20;
+float voltage_buf[VOLTAGE_SAMPLES] = {};
+int   voltage_idx      = 0;
+bool  voltage_buf_full = false;
 
-    print_help();
+// CONTROLLER DATA
+struct ControllerData {
+  int lx, ly, rx, ry;
+  int brake, throttle;
+  int buttons, dpad;
+};
+ControllerData controller;
+
+char buffer[64];
+uint8_t bufIdx = 0;
+
+// BUTTON BIT MASKS (Bluepad32)
+const int BTN_A  = (1 << 0);
+const int BTN_B  = (1 << 1);
+const int BTN_X  = (1 << 2);
+const int BTN_Y  = (1 << 3);
+const int BTN_LB = (1 << 4);
+const int BTN_RB = (1 << 5);
+const int BTN_LS = (1 << 8);
+const int BTN_RS = (1 << 9);
+
+// DPAD BITMASK VALUES (Bluepad32)
+const int DPAD_UP    = 0x01;
+const int DPAD_DOWN  = 0x02;
+const int DPAD_RIGHT = 0x04;
+const int DPAD_LEFT  = 0x08;
+
+// LED STATE
+int led_r = 0, led_g = 0, led_b = 0;
+bool rainbow_mode = false;
+float rainbow_hue = 0.0f;
+
+// SOUND STATE
+int current_track  = 1;
+const int MAX_TRACKS = 9;
+bool sound_playing = false;
+
+// SERIAL RX COUNTER (for debugging)
+unsigned long rxByteCount = 0;
+unsigned long rxParseCount = 0;
+
+// DEBUG
+static bool DEBUG_RAW_BYTES = false;
+
+
+// FORWARD DECLARATIONS
+float addVoltageSample(float v);
+float batteryPercent(float v);
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b);
+void handleLEDButtons(int buttons);
+void updateRainbow();
+void speakerSetup();
+void playTrack(int track);
+void stopSound();
+void handleSoundDpad(int dpad);
+void propellerSetup();
+void updatePropeller(int triggerValue);
+bool parseCSV(char* line, ControllerData& c);
+float applyDeadzone(float v);
+float applyCurve(float v);
+void computeMotorFromStick();
+void updateMotorRamp();
+void packData(can_frame &frame, const uint8_t *data, const int size);
+void createData(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size);
+void sendControlFrame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint);
+void drainCANStatus();
+void printRawBytes(const char* label, const struct can_frame& frame);
+void printStatus();
+
+
+// VOLTAGE AVERAGING
+float addVoltageSample(float v) {
+  voltage_buf[voltage_idx] = v;
+  voltage_idx = (voltage_idx + 1) % VOLTAGE_SAMPLES;
+  if (voltage_idx == 0) voltage_buf_full = true;
+  int count = voltage_buf_full ? VOLTAGE_SAMPLES : voltage_idx;
+  float sum = 0;
+  for (int i = 0; i < count; i++) sum += voltage_buf[i];
+  return sum / count;
 }
 
-void loop()
-{
-    static float       speed        = 0;
-    static float       position     = 0;
-    static CommandMode command_mode = Speed;
+// BATTERY PERCENTAGE (3S LiPo)
+float batteryPercent(float v) {
+  const float max_v = 12.6f;
+  const float min_v = 10.5f;
+  float pct = (v - min_v) / (max_v - min_v) * 100.0f;
+  return constrain(pct, 0.0f, 100.0f);
+}
 
-    // Send heartbeat every heartbeat_interval_ms milliseconds
-    unsigned long        now                 = millis();
-    static unsigned long heartbeat_last_sent = 0;
-    if (now - heartbeat_last_sent >= heartbeat_interval_ms)
-    {
-        // Heartbeat for the spark (FRC-style) and CTRE global-enable
-        // IMPORTANT: If control is lost (for example a joystick disconnect),
-        // stop sending the heartbeat - all motors will stop.
-        send_heartbeat(mcp2515, robot_state);
-        // TalonSRX and VictorSPX need a global enable
-        // TalonSrx::send_global_enable(mcp2515, true);
-        heartbeat_last_sent = now;
+
+// HSV TO RGB
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
+  float c = v * s;
+  float x = c * (1.0f - fabs(fmod(h / 60.0f, 2.0f) - 1.0f));
+  float m = v - c;
+  float r1, g1, b1;
+  if      (h <  60) { r1 = c; g1 = x; b1 = 0; }
+  else if (h < 120) { r1 = x; g1 = c; b1 = 0; }
+  else if (h < 180) { r1 = 0; g1 = c; b1 = x; }
+  else if (h < 240) { r1 = 0; g1 = x; b1 = c; }
+  else if (h < 300) { r1 = x; g1 = 0; b1 = c; }
+  else              { r1 = c; g1 = 0; b1 = x; }
+  r = (int)((r1 + m) * 255);
+  g = (int)((g1 + m) * 255);
+  b = (int)((b1 + m) * 255);
+}
+
+
+// LED: set color from controller buttons
+// A = green, B = red, X = blue, Y = yellow
+// LS (left stick click) = purple, RS (right stick click) = white
+void handleLEDButtons(int buttons) {
+  if      (buttons & BTN_A)  { rainbow_mode = false; led_r =   0; led_g = 255; led_b =   0; } // green
+  else if (buttons & BTN_B)  { rainbow_mode = false; led_r = 255; led_g =   0; led_b =   0; } // red
+  else if (buttons & BTN_X)  { rainbow_mode = false; led_r =   0; led_g =   0; led_b = 255; } // blue
+  else if (buttons & BTN_Y)  { rainbow_mode = false; led_r = 255; led_g = 180; led_b =   0; } // yellow
+  else if (buttons & BTN_LS) { rainbow_mode = false; led_r = 148; led_g =   0; led_b = 211; } // purple
+  else if (buttons & BTN_RS) { rainbow_mode = false; led_r = 255; led_g = 255; led_b = 255; } // white
+
+  if (!rainbow_mode) setColor(led_r, led_g, led_b);
+}
+
+// LED: advance rainbow cycle (call periodically)
+void updateRainbow() {
+  rainbow_hue += 4.0f;
+  if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
+  int r, g, b;
+  hsvToRgb(rainbow_hue, 1.0f, 1.0f, r, g, b);
+  setColor(r, g, b);
+}
+
+
+// SPEAKER: initialize DFPlayer
+void speakerSetup() {
+  dfPlayerSerial.begin(9600);
+  dfPlayerSerial.listen();
+  Serial.println("Initializing DFPlayer...");
+  delay(2000);
+  if (!dfPlayer.begin(dfPlayerSerial, false, false)) {
+    Serial.println("DFPlayer ERROR: check wiring and SD card");
+    dfPlayerReady = false;
+    controllerSerial.listen();
+    return;
+  }
+  Serial.println("DFPlayer ready");
+  dfPlayer.volume(30);
+  dfPlayerReady = true;
+  controllerSerial.listen();
+}
+
+// SPEAKER: play a specific track number
+void playTrack(int track) {
+  if (!dfPlayerReady) return;
+  Serial.print("Playing track: ");
+  Serial.println(track);
+  dfPlayerSerial.listen();
+  dfPlayer.play(track);
+  controllerSerial.listen();
+  sound_playing = true;
+}
+
+// SPEAKER: stop playback
+void stopSound() {
+  if (!dfPlayerReady) return;
+  Serial.println("Stopping audio");
+  dfPlayerSerial.listen();
+  dfPlayer.pause();
+  controllerSerial.listen();
+  sound_playing = false;
+}
+
+// SPEAKER: handle dpad input for sound selection
+//   UP    = play current track
+//   DOWN  = stop
+//   RIGHT = next track and play
+//   LEFT  = previous track and play
+void handleSoundDpad(int dpad) {
+  static int prev_dpad = 0;
+
+  if (dpad == prev_dpad) return;
+  prev_dpad = dpad;
+
+  if (dpad & DPAD_RIGHT) {
+    current_track++;
+    if (current_track > MAX_TRACKS) current_track = 1;
+    Serial.print("Selected track: ");
+    Serial.println(current_track);
+    playTrack(current_track);
+  }
+  else if (dpad & DPAD_LEFT) {
+    current_track--;
+    if (current_track < 1) current_track = MAX_TRACKS;
+    Serial.print("Selected track: ");
+    Serial.println(current_track);
+    playTrack(current_track);
+  }
+  else if (dpad & DPAD_UP) {
+    playTrack(current_track);
+  }
+  else if (dpad & DPAD_DOWN) {
+    stopSound();
+  }
+}
+
+
+// PROPELLER: initialize DRV8871 pins
+void propellerSetup() {
+  pinMode(motorIN1, OUTPUT);
+  pinMode(motorIN2, OUTPUT);
+  digitalWrite(motorIN1, LOW);
+  analogWrite(motorIN2, 0);
+  Serial.println("Propeller motor ready");
+}
+
+// PROPELLER: set speed from left trigger (0-1023 analog input)
+// Maps LT analog value to 0-128 PWM (capped at 50% for 12V battery)
+void updatePropeller(int triggerValue) {
+  int speed = map(triggerValue, 0, 1023, 0, 128);
+  if (speed < 10) speed = 0;  // small deadzone to prevent creep
+  digitalWrite(motorIN1, LOW);
+  analogWrite(motorIN2, speed);
+}
+
+
+// CSV PARSER: "lx,ly,rx,ry,brake,throttle,buttons,dpad"
+bool parseCSV(char* line, ControllerData& c) {
+  int fields[8];
+  int count = 0;
+  char* token = strtok(line, ",");
+  while (token != nullptr && count < 8) {
+    fields[count++] = atoi(token);
+    token = strtok(nullptr, ",");
+  }
+  if (count != 8) return false;
+  c.lx       = fields[0];
+  c.ly       = fields[1];
+  c.rx       = fields[2];
+  c.ry       = fields[3];
+  c.brake    = fields[4];
+  c.throttle = fields[5];
+  c.buttons  = fields[6];
+  c.dpad     = fields[7];
+  return true;
+}
+
+
+// DRIVING: apply deadzone to a -1..1 value
+float applyDeadzone(float v) {
+  if (fabs(v) < DEADZONE) return 0;
+  if (v > 0) return (v - DEADZONE) / (1.0f - DEADZONE);
+  else       return (v + DEADZONE) / (1.0f - DEADZONE);
+}
+
+// DRIVING: apply exponential response curve
+float applyCurve(float v) {
+  float sign = (v >= 0) ? 1.0f : -1.0f;
+  return pow(fabs(v), RESPONSE) * sign;
+}
+
+// DRIVING: compute left/right duty from stick input
+// Left stick Y = throttle (up = forward)
+// Right stick X = steering (right = turn right)
+void computeMotorFromStick() {
+  float throttle =  controller.rx / 512.0f;
+  float steering = -controller.ly / 512.0f;
+  throttle = applyCurve(applyDeadzone(throttle));
+  steering = applyCurve(applyDeadzone(steering));
+  float left  = throttle + steering;
+  float right = throttle - steering;
+  float maxVal = max(fabs(left), fabs(right));
+  if (maxVal > 1.0f) { left /= maxVal; right /= maxVal; }
+  duty_left_target  = left  * MAX_DUTY;
+  duty_right_target = right * MAX_DUTY;
+}
+
+// DRIVING: smooth ramp toward target duty
+void updateMotorRamp() {
+  auto rampAxis = [](float current, float target) -> float {
+    bool decelerating = fabs(target) < fabs(current);
+    float rate = decelerating ? RAMP_RATE_DECEL : RAMP_RATE_ACCEL;
+    if      (current < target) { current += rate; if (current > target) current = target; }
+    else if (current > target) { current -= rate; if (current < target) current = target; }
+    return current;
+  };
+  duty_left_current  = rampAxis(duty_left_current,  duty_left_target);
+  duty_right_current = rampAxis(duty_right_current, duty_right_target);
+}
+
+
+// CAN: pack bytes into a frame
+void packData(can_frame &frame, const uint8_t *data, const int size) {
+  for (int i = 0; i < size; i++) frame.data[i] = data[i];
+}
+
+// CAN: create data array from a value (pads remaining bytes with 0)
+void createData(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size) {
+  const byte* src = static_cast<const byte*>(data);
+  for (int i = 0; i < data_size; i++)  frame_data[i] = src[i];
+  for (int i = data_size; i < total_size; i++) frame_data[i] = 0;
+}
+
+// CAN: send a motor control frame
+void sendControlFrame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint) {
+  control_frame.can_id = (mode + device_id) | CAN_EFF_FLAG;
+  byte data[CONTROL_SIZE];
+  createData(&setpoint, data, 4, CONTROL_SIZE);
+  packData(control_frame, data, CONTROL_SIZE);
+  mcp2515.sendMessage(txb, &control_frame);
+}
+
+// CAN: read all pending status frames from motor controllers
+void drainCANStatus() {
+  struct can_frame rx;
+  while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
+    uint32_t id = rx.can_id & ~CAN_EFF_FLAG;
+
+    if (id == (status_1 + 1)) {
+      memcpy(&velocity_left, rx.data, 4);
+      temp_left = rx.data[4];
+      float raw_i = rx.data[6] * 0.125f;
+      if (raw_i < 40.0f) current_left = raw_i;
+      float new_v = rx.data[5] * 0.0658f;
+      if (new_v >= 10.0f) {
+        voltage = addVoltageSample(new_v);
+        bool idle = fabs(duty_left_current) < 0.05f && fabs(duty_right_current) < 0.05f;
+        if (idle) battery_pct = batteryPercent(voltage);
+      }
+      if (DEBUG_RAW_BYTES) printRawBytes("S1_L", rx);
     }
-
-    // SparkMax can be sent speed only on change
-    // TalonSRX needs to be constantly fed the speed
-    // Since in robotics applications (e.g., controlling a motor from a joystick) the speed rarely stays constant, we
-    // send it repeatively here
-    now                                  = millis();
-    static unsigned long speed_last_sent = 0;
-    if (now - speed_last_sent >= update_interval_ms)
-    {
-        switch (command_mode)
-        {
-        case Speed:
-            // SparkMax
-            if (homing_active)
-            {
-                spark.set_duty_cycle(homing_speed);
-            }
-            else
-            {
-                spark.set_duty_cycle(speed);
-            }
-            // TalonSRX
-            // talon.set_percent_output(speed);
-            break;
-        case Position:
-            // Use the position sensor (e.g., encoder, potentiometer) and use a PID to achieve that position
-            spark.set_position(position);
-            break;
-        default:
-            break;
-        }
-
-        speed_last_sent = now;
+    else if (id == (status_1 + 2)) {
+      memcpy(&velocity_right, rx.data, 4);
+      temp_right = rx.data[4];
+      float raw_i = rx.data[6] * 0.125f;
+      if (raw_i < 40.0f) current_right = raw_i;
+      if (DEBUG_RAW_BYTES) printRawBytes("S1_R", rx);
     }
-
-    // Small serial interface to control the motor
-    static String inBuf = "";
-    while (Serial.available())
-    {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r')
-        {
-            // Command + at least one char of argument
-            if (inBuf.length() >= 2)
-            {
-                if (inBuf[0] == 's')
-                {
-                    // Speed
-                    speed = (inBuf.substring(1)).toFloat();
-                    if (speed > 1.0f)
-                        speed = 1.0f;
-                    if (speed < -1.0f)
-                        speed = -1.0f;
-                    command_mode = Speed;
-                    Serial.print("Set speed: ");
-                    Serial.println(speed);
-                }
-                else if (inBuf[0] == 'p')
-                {
-                    // Position
-                    position     = (inBuf.substring(1)).toFloat();
-                    command_mode = Position;
-                    Serial.print("Set position: ");
-                    Serial.println(position);
-                }
-                else if (inBuf[0] == 'h')
-                {
-                    print_help();
-                }
-                else if (inBuf[0] == 'z')
-                {
-                    homing_active = true;
-                    command_mode  = Speed;
-                    speed         = homing_speed;
-                    Serial.println("Starting homing (driving positive)");
-                }
-                else if (inBuf[0] == 'c')
-                {
-                    homing_active = false;
-                    spark.stop();
-                    Serial.println("Homing cancelled");
-                }
-
-                // Clear buffer
-                inBuf = "";
-            }
-        }
-        else
-        {
-            inBuf += c;
-        }
+    else if (id == (status_2 + 1)) {
+      memcpy(&position_left, rx.data, 4);
+      if (DEBUG_RAW_BYTES) printRawBytes("S2_L", rx);
     }
-
-    // Read incoming CAN frames and update motor state objects.
-    struct can_frame rf;
-    while (mcp2515.readMessage(&rf) == MCP2515::ERROR_OK)
-    {
-        // Single-spark example: let the `spark` instance process the frame.
-        spark.handle_received_frame(rf);
+    else if (id == (status_2 + 2)) {
+      memcpy(&position_right, rx.data, 4);
+      if (DEBUG_RAW_BYTES) printRawBytes("S2_R", rx);
     }
+  }
+}
 
-    // If homing is active and we just saw the forward hard-limit edge, zero encoder
-    if (homing_active && spark.hard_forward_limit_reached() && !homing_prev_limit)
-    {
-        spark.stop();
-        speed = 0;
-        command_mode = Speed;
+// DEBUG: print raw CAN frame bytes
+void printRawBytes(const char* label, const struct can_frame& frame) {
+  Serial.print(label);
+  Serial.print(" RAW [hex]: ");
+  for (int i = 0; i < 8; i++) {
+    if (frame.data[i] < 0x10) Serial.print("0");
+    Serial.print(frame.data[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.print("| [dec]: ");
+  for (int i = 0; i < 8; i++) {
+    Serial.print(frame.data[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
 
-        MCP2515::ERROR setpos_err = spark.set_primary_encoder_position(0.0f);
-        Serial.print("Sent encoder-zero SET_PRIMARY_ENCODER_POSITION: ");
-        Serial.println(mcpErrorToString(setpos_err));
+// DEBUG: print telemetry to serial monitor
+void printStatus() {
+  Serial.print("LY=");       Serial.print(controller.ly);
+  Serial.print(" RX=");      Serial.print(controller.rx);
+  Serial.print(" | Target L="); Serial.print(duty_left_target);
+  Serial.print(" R=");       Serial.print(duty_right_target);
+  Serial.print(" | RPM L="); Serial.print(velocity_left);
+  Serial.print(" R=");       Serial.print(velocity_right);
+  Serial.print(" | Temp L="); Serial.print(temp_left);
+  Serial.print("C R=");      Serial.print(temp_right);
+  Serial.print("C | Volts="); Serial.print(voltage);
+  Serial.print(" | Batt=");  Serial.print(battery_pct);
+  Serial.print("% | Track="); Serial.print(current_track);
+  Serial.print(" | Prop=");  Serial.print(controller.brake);
+  Serial.print(" | RX=");    Serial.print(rxByteCount);
+  Serial.print("/");          Serial.println(rxParseCount);
+}
 
-        homing_active = false;
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+
+  // LED (set off immediately)
+  pinMode(redPin,   OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin,  OUTPUT);
+  setColor(0, 0, 0);
+
+  // CAN bus
+  heartbeat_frame.can_id  = HEARTBEAT_ID | CAN_EFF_FLAG;
+  heartbeat_frame.can_dlc = 8;
+  packData(heartbeat_frame, HEARTBEAT_DATA, 8);
+  control_frame.can_dlc = 8;
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ);
+  mcp2515.setNormalMode();
+
+  // Speaker
+  speakerSetup();
+
+  // Propeller motor
+  propellerSetup();
+
+  // Controller serial (must start AFTER speaker init)
+  controllerSerial.begin(9600);
+  controllerSerial.listen();
+
+  Serial.println("ROBOGOOSE READY");
+  Serial.println("Build: v7-propeller");
+  Serial.print("Free RAM: ");
+  extern int __heap_start, *__brkval;
+  int v;
+  Serial.println((int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval));
+  Serial.print("DFPlayer: ");
+  Serial.println(dfPlayerReady ? "OK" : "FAIL");
+  Serial.print("Controller listening on pin 3: ");
+  Serial.println(controllerSerial.isListening() ? "YES" : "NO");
+}
+
+
+// MAIN LOOP
+void loop() {
+
+  // Read all pending CAN status frames
+  drainCANStatus();
+
+  // Read controller data from Nano
+  while (controllerSerial.available()) {
+    char c = controllerSerial.read();
+    rxByteCount++;
+    if (c == '\n') {
+      buffer[bufIdx] = '\0';
+      if (bufIdx > 0 && parseCSV(buffer, controller)) {
+        rxParseCount++;
+        // Driving
+        computeMotorFromStick();
+
+        // LED colors via face buttons and stick clicks
+        handleLEDButtons(controller.buttons);
+
+        // LB = LEDs off, RB = rainbow mode
+        if      (controller.buttons & BTN_LB) { rainbow_mode = false; led_r = 0; led_g = 0; led_b = 0; setColor(0, 0, 0); }
+        else if (controller.buttons & BTN_RB) { rainbow_mode = true; }
+
+        // Sound selection via dpad
+        handleSoundDpad(controller.dpad);
+
+        // Propeller speed via left trigger (brake = LT analog 0-1023)
+        updatePropeller(controller.brake);
+      }
+      bufIdx = 0;
+    } else if (c != '\r' && bufIdx < sizeof(buffer) - 1) {
+      buffer[bufIdx++] = c;
+    } else {
+      bufIdx = 0;
     }
+  }
 
-    homing_prev_limit = spark.hard_forward_limit_reached();
+  unsigned long now = millis();
+
+  // Rainbow LED update (every 20ms)
+  static unsigned long rainbow_last = 0;
+  if (rainbow_mode && now - rainbow_last >= 20) {
+    updateRainbow();
+    rainbow_last = now;
+  }
+
+  // Motor ramp (every 1ms)
+  static unsigned long ramp_last = 0;
+  if (now - ramp_last >= 1) {
+    updateMotorRamp();
+    ramp_last = now;
+  }
+
+  // CAN heartbeat (every 10ms)
+  static unsigned long hb_last = 0;
+  if (now - hb_last >= 10) {
+    mcp2515.sendMessage(MCP2515::TXB0, &heartbeat_frame);
+    hb_last = now;
+  }
+
+  // Left motor command (every 10ms)
+  static unsigned long ctrl_left_last = 5;
+  if (now - ctrl_left_last >= 10) {
+    sendControlFrame(MCP2515::TXB1, 1, Duty_Cycle_Set, duty_left_current);
+    ctrl_left_last = now;
+  }
+
+  // Right motor command (every 10ms, offset 5ms from left)
+  static unsigned long ctrl_right_last = 10;
+  if (now - ctrl_right_last >= 10) {
+    sendControlFrame(MCP2515::TXB2, 2, Duty_Cycle_Set, duty_right_current);
+    ctrl_right_last = now;
+  }
+
+  // Serial telemetry (every 100ms)
+  static unsigned long print_last = 0;
+  if (now - print_last >= 100) {
+    printStatus();
+    print_last = now;
+  }
 }

@@ -1,4 +1,7 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:system",
-    "python-envs.pythonProjects": []
+    "python-envs.pythonProjects": [],
+    "platformio-ide.useBuiltinPIOCore": true,
+    "platformio-ide.pioHomeServerHttpPort": 8010,
+    "platformio-ide.customPATH": "/Users/samtiso/.platformio/penv/bin"
 }

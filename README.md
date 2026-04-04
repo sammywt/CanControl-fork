@@ -1,4 +1,10 @@
 # CanControl
+TO RUN EXISTING CODE IN CURRENT BRANCH (attempt-adding-ctrl)
+command in terminal is: pio run -e uno -t upload && pio device monitor -b 115200
+
+use L or R followed by float (2 places) can take numbers from -1 to 1 in increments of .01
+EX: L.01 + enter key OR R-.5 + enter key
+0 + enter key stops both motors
 
 **CanControl** is a library for controlling CAN-based motor controllers (REV Spark MAX, CTRE Talon SRX, Victor SPX) from **Arduino** boards using an **MCP2515 CAN Shield**.
 CanControl currently supports:
@@ -8,6 +14,12 @@ CanControl currently supports:
 - [CTRE Victor SPX](https://store.ctr-electronics.com/products/victor-spx) (PercentOutput only)
 
 It handles the necessary FRC-style "Heartbeat" frames and providing high-level wrappers, so you can control FRC motor controllers without a roboRIO.
+
+# Xbox Controller Input
+Added xbox controller communication through TX from ESP32 to pin 3 on the Arduino. Packet recieved contains CSV data for all controller inputs. Code reads control stick data and moves corresponding motor with a range of 0.0 for no trigger input and 0.3 on full stick movement. Left Stick moved forward/backward. Right Stick turns left/right.
+An exponential ramp up is used to prevent force from motor jerk.
+Buttons are used to test RGB LED colors as well as the analog left trigger to use the motor driver.
+Directional Pad is used to cycle through and play speaker sounds.
 
 ## Features
 
