@@ -1,46 +1,52 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <mcp2515.h>
-#include <SoftwareSerial.h>
 #include <math.h>
+#include <Servo.h>
 #include "DFRobotDFPlayerMini.h"
 
-// PIN ASSIGNMENTS
-// 2       = CAN INT
-// 3       = Controller serial RX (from Nano)
-// 4       = Blue LED (digital on/off, no PWM on this pin)
-// 5       = Green LED (PWM)
-// 6       = Red LED (PWM)
-// 7       = DFPlayer RX (from player)
-// 8       = DFPlayer TX (to player)
-// 9       = DRV8871 IN2 (PWM speed control)
-// 10..13  = SPI for MCP2515 CAN
-// A0      = DRV8871 IN1 (direction, digital only)
+// PIN ASSIGNMENTS (Arduino Mega)
+// Serial1 (18 TX, 19 RX) = Controller input from Nano
+// Serial2 (16 TX, 17 RX) = DFPlayer Mini
+// SPI (50 MISO, 51 MOSI, 52 SCK, 53 SS) = MCP2515 CAN
+// 2  = CAN INT
+// 3  = Red LED (PWM)
+// 4  = Green LED (PWM)
+// 5  = Blue LED (PWM)
+// 6  = DRV8871 IN2 propeller speed (PWM)
+// 7  = DRV8871 IN1 propeller direction
+// 8  = Hopper servo
 
-SoftwareSerial controllerSerial(3, -1);  // RX only from Nano
-SoftwareSerial dfPlayerSerial(7, 8);     // RX, TX for DFPlayer Mini
-
-MCP2515 mcp2515(10);
+MCP2515 mcp2515(53);
 DFRobotDFPlayerMini dfPlayer;
 bool dfPlayerReady = false;
+Servo hopperServo;
 
-// RGB LED pins (Common Cathode: HIGH = on)
-const int redPin   = 6;   // PWM
-const int greenPin = 5;   // PWM
-const int bluePin  = 4;   // digital only (no PWM on Uno pin 4)
+// RGB LED pins (Common Cathode)
+const int redPin   = 3;
+const int greenPin = 4;
+const int bluePin  = 5;
 
-// DRV8871 motor driver pins (propeller hat)
-const int motorIN1 = A0;  // direction pin (held LOW for forward)
-const int motorIN2 = 9;   // PWM speed pin
+// motor driver pins (propeller hat)
+const int motorIN1 = 7;
+const int motorIN2 = 6;
+
+// Hopper servo pin
+const int servoPin = 8;
+
+// Servo positions
+const int HOPPER_CLOSED = 75;   //
+const int HOPPER_OPEN   = 170;  //
+
+// Hopper state
+bool hopper_open = false;
 
 
-// LED COLOR
-// Red and green use analogWrite for brightness control
-// Blue uses digitalWrite (on/off only, pin 4 has no PWM)
+// LED COLOR (common cathode, all PWM)
 void setColor(int r, int g, int b) {
   analogWrite(redPin,   r);
   analogWrite(greenPin, g);
-  digitalWrite(bluePin, (b > 127) ? HIGH : LOW);
+  analogWrite(bluePin,  b);
 }
 
 
@@ -161,6 +167,9 @@ void stopSound();
 void handleSoundDpad(int dpad);
 void propellerSetup();
 void updatePropeller(int triggerValue);
+void hopperSetup();
+void hopperToggle();
+void handleHopperButton(int buttons);
 bool parseCSV(char* line, ControllerData& c);
 float applyDeadzone(float v);
 float applyCurve(float v);
@@ -236,22 +245,19 @@ void updateRainbow() {
 }
 
 
-// SPEAKER: initialize DFPlayer
+// SPEAKER: initialize DFPlayer on Serial2 (hardware serial)
 void speakerSetup() {
-  dfPlayerSerial.begin(9600);
-  dfPlayerSerial.listen();
+  Serial2.begin(9600);
   Serial.println("Initializing DFPlayer...");
   delay(2000);
-  if (!dfPlayer.begin(dfPlayerSerial, false, false)) {
+  if (!dfPlayer.begin(Serial2, false, false)) {
     Serial.println("DFPlayer ERROR: check wiring and SD card");
     dfPlayerReady = false;
-    controllerSerial.listen();
     return;
   }
   Serial.println("DFPlayer ready");
   dfPlayer.volume(30);
   dfPlayerReady = true;
-  controllerSerial.listen();
 }
 
 // SPEAKER: play a specific track number
@@ -259,9 +265,7 @@ void playTrack(int track) {
   if (!dfPlayerReady) return;
   Serial.print("Playing track: ");
   Serial.println(track);
-  dfPlayerSerial.listen();
   dfPlayer.play(track);
-  controllerSerial.listen();
   sound_playing = true;
 }
 
@@ -269,17 +273,11 @@ void playTrack(int track) {
 void stopSound() {
   if (!dfPlayerReady) return;
   Serial.println("Stopping audio");
-  dfPlayerSerial.listen();
   dfPlayer.pause();
-  controllerSerial.listen();
   sound_playing = false;
 }
 
 // SPEAKER: handle dpad input for sound selection
-//   UP    = play current track
-//   DOWN  = stop
-//   RIGHT = next track and play
-//   LEFT  = previous track and play
 void handleSoundDpad(int dpad) {
   static int prev_dpad = 0;
 
@@ -319,12 +317,40 @@ void propellerSetup() {
 }
 
 // PROPELLER: set speed from left trigger (0-1023 analog input)
-// Maps LT analog value to 0-128 PWM (capped at 50% for 12V battery)
+// Capped at 50% PWM for 12V battery safety
 void updatePropeller(int triggerValue) {
   int speed = map(triggerValue, 0, 1023, 0, 128);
-  if (speed < 10) speed = 0;  // small deadzone to prevent creep
+  if (speed < 10) speed = 0;
   digitalWrite(motorIN1, LOW);
   analogWrite(motorIN2, speed);
+}
+
+
+// HOPPER: initialize servo
+void hopperSetup() {
+  hopperServo.attach(servoPin);
+  hopperServo.write(HOPPER_CLOSED);
+  hopper_open = false;
+  Serial.println("Hopper servo ready (closed)");
+}
+
+// HOPPER: toggle open/closed
+void hopperToggle() {
+  hopper_open = !hopper_open;
+  hopperServo.write(hopper_open ? HOPPER_OPEN : HOPPER_CLOSED);
+  Serial.print("Hopper ");
+  Serial.println(hopper_open ? "OPEN" : "CLOSED");
+}
+
+// HOPPER: check LB button and toggle (edge detection)
+void handleHopperButton(int buttons) {
+  static bool prev_lb = false;
+  bool lb_now = buttons & BTN_LB;
+
+  if (lb_now && !prev_lb) {
+    hopperToggle();
+  }
+  prev_lb = lb_now;
 }
 
 
@@ -364,8 +390,6 @@ float applyCurve(float v) {
 }
 
 // DRIVING: compute left/right duty from stick input
-// Left stick Y = throttle (up = forward)
-// Right stick X = steering (right = turn right)
 void computeMotorFromStick() {
   float throttle =  controller.rx / 512.0f;
   float steering = -controller.ly / 512.0f;
@@ -398,7 +422,7 @@ void packData(can_frame &frame, const uint8_t *data, const int size) {
   for (int i = 0; i < size; i++) frame.data[i] = data[i];
 }
 
-// CAN: create data array from a value (pads remaining bytes with 0)
+// CAN: create data array from a value
 void createData(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size) {
   const byte* src = static_cast<const byte*>(data);
   for (int i = 0; i < data_size; i++)  frame_data[i] = src[i];
@@ -414,7 +438,7 @@ void sendControlFrame(MCP2515::TXBn txb, const uint32_t device_id, const control
   mcp2515.sendMessage(txb, &control_frame);
 }
 
-// CAN: read all pending status frames from motor controllers
+// CAN: read all pending status frames
 void drainCANStatus() {
   struct can_frame rx;
   while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
@@ -468,7 +492,7 @@ void printRawBytes(const char* label, const struct can_frame& frame) {
   Serial.println();
 }
 
-// DEBUG: print telemetry to serial monitor
+// DEBUG: print telemetry
 void printStatus() {
   Serial.print("LY=");       Serial.print(controller.ly);
   Serial.print(" RX=");      Serial.print(controller.rx);
@@ -482,6 +506,7 @@ void printStatus() {
   Serial.print(" | Batt=");  Serial.print(battery_pct);
   Serial.print("% | Track="); Serial.print(current_track);
   Serial.print(" | Prop=");  Serial.print(controller.brake);
+  Serial.print(" | Hopper="); Serial.print(hopper_open ? "OPEN" : "CLOSED");
   Serial.print(" | RX=");    Serial.print(rxByteCount);
   Serial.print("/");          Serial.println(rxParseCount);
 }
@@ -491,13 +516,13 @@ void printStatus() {
 void setup() {
   Serial.begin(115200);
 
-  // LED (set off immediately)
+  // LED
   pinMode(redPin,   OUTPUT);
   pinMode(greenPin, OUTPUT);
   pinMode(bluePin,  OUTPUT);
   setColor(0, 0, 0);
 
-  // CAN bus
+  // CAN bus (Mega SPI CS = pin 53)
   heartbeat_frame.can_id  = HEARTBEAT_ID | CAN_EFF_FLAG;
   heartbeat_frame.can_dlc = 8;
   packData(heartbeat_frame, HEARTBEAT_DATA, 8);
@@ -506,57 +531,51 @@ void setup() {
   mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ);
   mcp2515.setNormalMode();
 
-  // Speaker
+  // Speaker on Serial2
   speakerSetup();
 
   // Propeller motor
   propellerSetup();
 
-  // Controller serial (must start AFTER speaker init)
-  controllerSerial.begin(9600);
-  controllerSerial.listen();
+  // Hopper servo
+  hopperSetup();
 
-  Serial.println("ROBOGOOSE READY");
-  Serial.println("Build: v7-propeller");
-  Serial.print("Free RAM: ");
-  extern int __heap_start, *__brkval;
-  int v;
-  Serial.println((int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval));
-  Serial.print("DFPlayer: ");
-  Serial.println(dfPlayerReady ? "OK" : "FAIL");
-  Serial.print("Controller listening on pin 3: ");
-  Serial.println(controllerSerial.isListening() ? "YES" : "NO");
+  // Controller input on Serial1
+  Serial1.begin(9600);
+
+  Serial.println("ROBOGOOSE MEGA READY");
 }
 
 
 // MAIN LOOP
 void loop() {
 
-  // Read all pending CAN status frames
   drainCANStatus();
 
-  // Read controller data from Nano
-  while (controllerSerial.available()) {
-    char c = controllerSerial.read();
+  // Read controller data from Nano on Serial1
+  while (Serial1.available()) {
+    char c = Serial1.read();
     rxByteCount++;
     if (c == '\n') {
       buffer[bufIdx] = '\0';
       if (bufIdx > 0 && parseCSV(buffer, controller)) {
         rxParseCount++;
-        // Driving
+
         computeMotorFromStick();
 
-        // LED colors via face buttons and stick clicks
         handleLEDButtons(controller.buttons);
 
-        // LB = LEDs off, RB = rainbow mode
-        if      (controller.buttons & BTN_LB) { rainbow_mode = false; led_r = 0; led_g = 0; led_b = 0; setColor(0, 0, 0); }
-        else if (controller.buttons & BTN_RB) { rainbow_mode = true; }
+        // LB = hopper toggle
+        handleHopperButton(controller.buttons);
 
-        // Sound selection via dpad
+        // RB = rainbow mode
+        if (controller.buttons & BTN_RB) { rainbow_mode = true; }
+
+        // RT (throttle) = LEDs off
+        if (controller.throttle > 10) { rainbow_mode = false; led_r = 0; led_g = 0; led_b = 0; setColor(0, 0, 0); }
+
         handleSoundDpad(controller.dpad);
 
-        // Propeller speed via left trigger (brake = LT analog 0-1023)
         updatePropeller(controller.brake);
       }
       bufIdx = 0;
@@ -597,7 +616,7 @@ void loop() {
     ctrl_left_last = now;
   }
 
-  // Right motor command (every 10ms, offset 5ms from left)
+  // Right motor command (every 10ms, offset 5ms)
   static unsigned long ctrl_right_last = 10;
   if (now - ctrl_right_last >= 10) {
     sendControlFrame(MCP2515::TXB2, 2, Duty_Cycle_Set, duty_right_current);
