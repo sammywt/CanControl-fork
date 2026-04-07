@@ -15,7 +15,7 @@
 // 5  = Blue LED (PWM)
 // 6  = DRV8871 IN2 propeller speed (PWM) [Green]
 // 7  = DRV8871 IN1 propeller direction [White]
-// 8  = Hopper servo [Brown]
+// 8  = Hopper servo [Orange]
 
 MCP2515 mcp2515(53);
 DFRobotDFPlayerMini dfPlayer;
