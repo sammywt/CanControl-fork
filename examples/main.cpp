@@ -41,7 +41,7 @@ bool hopper_open = false;
 
 
 // SD CARD FOLDER LAYOUT
-//   01 - startup sound (could be randomized later)
+//   01 - startup sound
 //   02 - d pad tracks
 //   03 - annoying sounds (Y button)
 //   04 - honks           (X button)
@@ -71,7 +71,7 @@ bool hopper_open = false;
 // /05/003.mp3  Tainted Love intro
 // /05/004.mp3  Umbrella intro
 // /05/005.mp3  Rasputin intro
-// /05/009.mp3  Sweet Dreams intro
+// /05/008.mp3  Sweet Dreams intro
 
 // /06/001.mp3  "Welcome to DJ Goose"
 // /06/002.mp3  "DJ Goose Signing Off"
@@ -96,6 +96,7 @@ const int DJ_OFF_FILE         = 2;  // "DJ Goose Signing Off"
 // if a track number is in this list, its intro will play before the song
 const int DJ_INTRO_TRACKS[] = {1, 2, 3, 4, 5, 8};
 const int DJ_INTRO_COUNT = 6;
+const unsigned long DJ_INTRO_DURATION = 4800; // flat wait (in ms) for all intros
 
 
 // LED COLOR (common cathode)
@@ -201,7 +202,7 @@ float rainbow_hue = 0.0f;
 
 // LED BREATHING (sine wave oscillation)
 float breathPhase = 0.0f;
-const float BREATH_SPEED = 0.04f; 
+const float BREATH_SPEED = 0.04f;
 
 // SOUND STATE
 int current_track = 1;     // currently selected track in folder 02
@@ -212,7 +213,6 @@ bool dj_mode = false;
 bool dj_intro_playing = false;  // true while a DJ intro is playing
 int dj_pending_track = 0;       // track to play after intro finishes
 unsigned long dj_intro_start = 0;
-const unsigned long DJ_INTRO_TIMEOUT = 8000; // safety timeout if finish detection fails (ms)
 
 // SERIAL RX COUNTER (for debugging connection)
 unsigned long rxByteCount = 0;
@@ -351,13 +351,17 @@ void handleLEDButtons(int buttons) {
   else if (buttons & BTN_RS) { rainbow_mode = false; leds_off = false; led_r = 255; led_g = 255; led_b = 255; } // white
 }
 
-// cycles through HSV color wheel at full brightness (no breathing)
+// cycles through colors smoothly (perceptually even, no blue lingering)
+// uses direct sine waves on each channel offset by 120 degrees
 void updateRainbow() {
-  rainbow_hue += 8.0f; // 8 degrees per tick = fast cycle
+  rainbow_hue += 2.0f; // degrees per tick (smooth cycle)
   if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
-  int r, g, b;
-  hsvToRgb(rainbow_hue, 1.0f, 1.0f, r, g, b);
-  setColor(r, g, b);
+  float rad = rainbow_hue * PI / 180.0f;
+  // three sine waves 120 degrees apart = smooth RGB cycling
+  float r = sin(rad)           * 0.5f + 0.5f;
+  float g = sin(rad + 2.094f)  * 0.5f + 0.5f; // +120 degrees
+  float b = sin(rad + 4.189f)  * 0.5f + 0.5f; // +240 degrees
+  setColor((int)(r * 255), (int)(g * 255), (int)(b * 255));
 }
 
 
@@ -373,25 +377,26 @@ void speakerSetup() {
   }
   Serial.println("DFPlayer ready");
   dfPlayer.volume(30); // max volume (0-30)
+  delay(500); // extra settle time so startup sound doesn't get missed
   dfPlayerReady = true;
 }
 
 // plays a music track from folder 02
-// if DJ mode is on and this track has an intro, plays intro first
+// if DJ mode is on and this track has an intro, plays intro first then waits 5 seconds
 void playMusicTrack(int track) {
   if (!dfPlayerReady) return;
 
   if (dj_mode && trackHasDJIntro(track)) {
-    // play the DJ intro, queue the actual song for after
+    // this track has a DJ intro, play it and queue the song
     Serial.print("DJ intro for track ");
     Serial.println(track);
     dfPlayer.playFolder(FOLDER_DJ_INTRO, track);
     dj_intro_playing = true;
     dj_pending_track = track;
-    dj_intro_start = millis(); // start timeout timer as safety net
+    dj_intro_start = millis();
     sound_playing = true;
   } else {
-    // no DJ mode or no intro exists, just play the song
+    // no DJ mode or no intro, just play the song directly
     Serial.print("Playing track ");
     Serial.println(track);
     dfPlayer.playFolder(FOLDER_MUSIC, track);
@@ -503,28 +508,12 @@ void handleDJModeToggle(int buttons) {
   prev_ls = ls_now;
 }
 
-// checks if DJ intro finished playing, then starts the actual song
-// uses DFPlayer's finish detection so each intro plays its exact length
-// has a safety timeout in case finish detection fails
+// waits 5 seconds for DJ intro to finish, then plays the queued music track
 void updateDJMode() {
   if (!dj_intro_playing) return;
 
-  // check if DFPlayer reports the intro finished
-  if (dfPlayer.available()) {
-    int type = dfPlayer.readType();
-    if (type == DFPlayerPlayFinished) {
-      Serial.print("DJ intro finished, playing track ");
-      Serial.println(dj_pending_track);
-      delay(100); // tiny gap between intro and song
-      dfPlayer.playFolder(FOLDER_MUSIC, dj_pending_track);
-      dj_intro_playing = false;
-      return;
-    }
-  }
-
-  // safety timeout: if finish detection doesn't fire, plays anyway
-  if (millis() - dj_intro_start >= DJ_INTRO_TIMEOUT) {
-    Serial.print("DJ intro timeout, playing track ");
+  if (millis() - dj_intro_start >= DJ_INTRO_DURATION) {
+    Serial.print("DJ intro done, playing track ");
     Serial.println(dj_pending_track);
     dfPlayer.playFolder(FOLDER_MUSIC, dj_pending_track);
     dj_intro_playing = false;
@@ -779,7 +768,7 @@ void setup() {
 void loop() {
 
   drainCANStatus(); // read motor telemetry
-  updateDJMode();   // check if DJ intro finished
+  updateDJMode();   // check if DJ intro timer expired
 
   // read controller CSV data from Nano on Serial1
   while (Serial1.available()) {
