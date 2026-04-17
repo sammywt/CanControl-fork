@@ -3,12 +3,17 @@
 #include <mcp2515.h>
 #include <math.h>
 #include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
 #include "DFRobotDFPlayerMini.h"
 
 // PIN ASSIGNMENTS (Arduino Mega)
 // Serial1 (19 RX) = Controller input from Nano [Purple]
 // Serial2 (16 TX, 17 RX) = DFPlayer Mini [Green, Yellow]
-// SPI (50 MISO, 51 MOSI, 52 SCK, 53 SS) = MCP2515 CAN [Gray]
+// SPI (50 MISO, 51 MOSI, 52 SCK, 53 CS) = MCP2515 CAN [Gray]
+// I2C (20 SDA, 21 SCL) = 12x2 LCD with I2C adapter
 // 2  = CAN INT [Blue]
 // 3  = Red LED (PWM)
 // 4  = Green LED (PWM)
@@ -22,14 +27,23 @@ DFRobotDFPlayerMini dfPlayer;
 bool dfPlayerReady = false;
 Servo hopperServo;
 
+// LCD (I2C address 0x27 is most common, try 0x3F if it doesn't work)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// BNO055 IMU on I2C (shares bus with LCD, different address)
+// used for anti-tip protection during hard braking
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+bool imuReady = false;
+float pitch = 0.0f; // current forward/back tilt angle in degrees
+
 // RGB LED pins (Common Cathode)
 const int redPin   = 3;
 const int greenPin = 4;
 const int bluePin  = 5;
 
 // motor driver pins (propeller hat)
-const int motorIN1 = 7; // Direction
-const int motorIN2 = 6; // Speed
+const int motorIN1 = 7;
+const int motorIN2 = 6;
 
 // Hopper servo pin
 const int servoPin = 8;
@@ -40,6 +54,14 @@ const int HOPPER_OPEN   = 170;
 bool hopper_open = false;
 
 
+// SERIAL DEBUG TOGGLE                                          //CHANGE ME TO ENABLE/DISABLE SERIAL OUTPUT
+// flip to false when running on battery to speed up the loop
+// serial prints block the loop for a few ms each, adds up fast
+// DEBUG_RAW_BYTES dumps the raw CAN frame bytes, only useful when decoding new status frames
+static bool SERIAL_ENABLED = false;
+static bool DEBUG_RAW_BYTES = false;
+
+
 // SD CARD FOLDER LAYOUT
 //   01 - startup sound
 //   02 - d pad tracks
@@ -47,34 +69,7 @@ bool hopper_open = false;
 //   04 - honks           (X button)
 //   05 - DJGoose Intros
 //   06 - NarrationToggle (L Stick Click)
-//
-// /01/001.mp3                    = startup sound
-// /02/001.mp3  Nirvana
-// /02/002.mp3  Manchild
-// /02/003.mp3  Tainted Love
-// /02/004.mp3  Umbrella
-// /02/005.mp3  Rasputin
-// /02/006.mp3  Mission Impossible
-// /02/007.mp3  James Bond
-// /02/008.mp3  Sweet Dreams
-
-// /03/001.mp3  Apple Pay         /03/006.mp3  Bell
-// /03/002.mp3  Lego              /03/007.mp3  Windows
-// /03/003.mp3  Smoke Alarm       /03/008.mp3  Bonk
-// /03/004.mp3  Pan               /03/009.mp3  Snake
-// /03/005.mp3  Fnaf squeak       /03/010.mp3  Dialup
-
-// /04/001.mp3 to 007.mp3          = honk sounds
-
-// /05/001.mp3  Nirvana intro
-// /05/002.mp3  Manchild intro
-// /05/003.mp3  Tainted Love intro
-// /05/004.mp3  Umbrella intro
-// /05/005.mp3  Rasputin intro
-// /05/008.mp3  Sweet Dreams intro
-
-// /06/001.mp3  "Welcome to DJ Goose"
-// /06/002.mp3  "DJ Goose Signing Off"
+// too lazy to list them all, check the SD card
 
 // folder number (can be up to 99)
 const int FOLDER_STARTUP  = 1;
@@ -83,20 +78,19 @@ const int FOLDER_RANDOM   = 3;
 const int FOLDER_HONK     = 4;
 const int FOLDER_DJ_INTRO = 5;
 const int FOLDER_DJ_SFX   = 6;
-// track counts (can be up to 255)
-const int STARTUP_FILE        = 1;
-const int MUSIC_TRACK_COUNT   = 8;
-const int RANDOM_TRACK_COUNT  = 10;
-const int HONK_TRACK_COUNT    = 7;
+// track counts (can be up to 255)                              //CHANGE ME WHEN UPDATING TRACK COUNTS
+const int STARTUP_TRACK_COUNT = 3;
+const int MUSIC_TRACK_COUNT   = 20;
+const int RANDOM_TRACK_COUNT  = 16;
+const int HONK_TRACK_COUNT    = 17;
 // Narration On/Off toggle
-const int DJ_ON_FILE          = 1;  // "Welcome to DJ Goose"
-const int DJ_OFF_FILE         = 2;  // "DJ Goose Signing Off"
+const int DJ_ON_FILE          = 1;
+const int DJ_OFF_FILE         = 2;
 
 // Tracks that have DJ intros in folder 05
-// if a track number is in this list, its intro will play before the song
 const int DJ_INTRO_TRACKS[] = {1, 2, 3, 4, 5, 8};
 const int DJ_INTRO_COUNT = 6;
-const unsigned long DJ_INTRO_DURATION = 4800; // flat wait (in ms) for all intros
+const unsigned long DJ_INTRO_DURATION = 5000;
 
 
 // LED COLOR (common cathode)
@@ -136,30 +130,62 @@ struct can_frame control_frame;
 const uint8_t CONTROL_SIZE = 8;
 
 
-// DRIVING CONSTANTS
-const float MAX_DUTY        = 0.3f;   // max motor power (30%)
-const float DEADZONE        = 0.15f;  // stick deadzone threshold
-const float RESPONSE        = 2.0f;   // exponential curve power
-const float RAMP_RATE_ACCEL = 0.002f; // how fast motors ramp up
-const float RAMP_RATE_DECEL = 0.002f; // how fast motors ramp down
+// DRIVING CONSTANTS                                        //CHANGE ME TO CHANGE SPEEDS
+const float MAX_DUTY        = 0.50f;  // cap on motor power, 1.0 = full send, keep low for safety
+const float DEADZONE        = 0.15f;  // ignore tiny stick movements so the goose doesn't creep
+const float RESPONSE        = 2.0f;   // 1.0=linear stick, 2.0=quadratic (more precision near center)
+
+// RAMP RATES                                                    //CHANGE ME TO CHANGE RAMP FEEL
+// the ramp logic applies to throttle and steering targets, not the final motor duty
+// because of that, changing steering ramp affects driving feel when turning while moving
+// and changing throttle ramp affects how steering feels when braking mid-turn
+// this is kind of unavoidable with tank drive mixing, just something to keep in mind while tuning
+// accel = how fast the value ramps up when pushing the stick
+// decel = how fast it ramps back down when letting go or flicking the opposite way
+const float THROTTLE_RAMP_ACCEL = 0.0007f; // forward/back accel - lower = smoother starts
+const float THROTTLE_RAMP_DECEL = 0.0012f; // forward/back decel - higher = faster braking
+const float STEERING_RAMP_ACCEL = 0.001f;  // turning accel - lower = more gradual turns
+const float STEERING_RAMP_DECEL = 0.005f;  // turning decel - how fast turning eases out
+
+// ANTI-TIP SETTINGS (BNO055 IMU)                                //CHANGE ME TO TUNE ANTI-TIP
+// two-stage protection against tipping forward during hard braking:
+//
+// STAGE 1 - brake softening: when forward tilt crosses TILT_THRESHOLD, the decel rate
+// gets scaled down proportionally. at TILT_MAX the brake is at 10% of normal strength.
+// this is passive - just eases off the brake so the goose settles back down.
+//
+// STAGE 2 - active catch boost: when forward tilt exceeds TILT_MAX (about to tip),
+// both motors briefly drive forward to slide the wheels under the falling goose.
+// this is aggressive - the bigger CATCH_GAIN, the harder the save. too aggressive
+// and it can oscillate or drive you into stuff. start low and work up.
+//
+// forward tilt is (TILT_RESTING - current_pitch), so bigger = more tipping
+const float TILT_RESTING   = 14.0f;  // measured with the goose sitting level
+const float TILT_THRESHOLD = 3.0f;   // when brake softening starts kicking in
+const float TILT_MAX       = 7.0f;   // when brake is at 10%, and catch boost begins
+const float CATCH_GAIN     = 0.03f;  // duty cycle added per degree of tilt past TILT_MAX
+const float CATCH_MAX      = 0.30f;  // safety cap - never add more than this much boost
+
 
 // MOTOR STATE
-float duty_left_target   = 0.0f;
-float duty_right_target  = 0.0f;
-float duty_left_current  = 0.0f; // actual value sent to motor (ramped)
+float duty_left_current  = 0.0f;
 float duty_right_current = 0.0f;
+
+// RAMPED STICK STATE
+float throttle_target  = 0.0f;
+float steering_target  = 0.0f;
+float throttle_current = 0.0f;
+float steering_current = 0.0f;
 
 // SENSOR STATE (from Spark MAX status frames)
 float   velocity_left  = 0.0f;
 float   velocity_right = 0.0f;
 float   position_left  = 0.0f;
 float   position_right = 0.0f;
-float   current_left   = 0.0f;  // motor current in amps
-float   current_right  = 0.0f;
-uint8_t temp_left      = 0;     // motor temp in celsius
+uint8_t temp_left      = 0;
 uint8_t temp_right     = 0;
-float   voltage        = 0.0f;  // bus voltage (rolling average)
-float   battery_pct    = 0.0f;  // estimated battery percentage
+float   voltage        = 0.0f;
+float   battery_pct    = 0.0f;
 
 // Voltage rolling average (smooths out noisy readings)
 static constexpr int VOLTAGE_SAMPLES = 20;
@@ -169,14 +195,14 @@ bool  voltage_buf_full = false;
 
 // CONTROLLER DATA (parsed from Nano CSV)
 struct ControllerData {
-  int lx, ly, rx, ry;       // stick axes (-511 to 512)
-  int brake, throttle;       // triggers (0 to 1023)
-  int buttons, dpad;         // bitmasks
+  int lx, ly, rx, ry;
+  int brake, throttle;
+  int buttons, dpad;
 };
 ControllerData controller;
 
-char buffer[64];     // serial receive buffer
-uint8_t bufIdx = 0;  // current position in buffer
+char buffer[64];
+uint8_t bufIdx = 0;
 
 // BUTTON BIT MASKS (Bluepad32 format)
 const int BTN_A  = (1 << 0);
@@ -185,8 +211,9 @@ const int BTN_X  = (1 << 2);
 const int BTN_Y  = (1 << 3);
 const int BTN_LB = (1 << 4);
 const int BTN_RB = (1 << 5);
-const int BTN_LS = (1 << 8);  // left stick click
-const int BTN_RS = (1 << 9);  // right stick click
+const int BTN_LS = (1 << 8);
+const int BTN_RS = (1 << 9);
+const int BTN_MENU = (1 << 6);                                 //CHANGE ME IF MENU BUTTON DOESN'T WORK
 
 // DPAD BITMASK VALUES (Bluepad32 format)
 const int DPAD_UP    = 0x01;
@@ -197,29 +224,38 @@ const int DPAD_LEFT  = 0x08;
 // LED STATE
 int led_r = 0, led_g = 0, led_b = 0;
 bool rainbow_mode = false;
-bool leds_off = true;  // starts off, wakes up during startup
+bool leds_off = true;
 float rainbow_hue = 0.0f;
 
-// LED BREATHING (sine wave oscillation)
-float breathPhase = 0.0f;
-const float BREATH_SPEED = 0.04f;
+// LED BREATHING / BLINK ANIMATION                                      //CHANGE ME TO CHANGE EYES
+const unsigned long BLINK_HOLD_BRIGHT = 2000;
+const unsigned long BLINK_CLOSE_TIME  = 600;
+const unsigned long BLINK_HOLD_DIM    = 300;
+const unsigned long BLINK_OPEN_TIME   = 600;
+const float BLINK_DIM_LEVEL = 0.05f;
+int blinkState = 0;
+unsigned long blinkTimer = 0;
+
+// RAINBOW SPEED (adjustable)
+const float RAINBOW_SPEED = 8.0f;
 
 // SOUND STATE
-int current_track = 1;     // currently selected track in folder 02
+int current_track = 1;
 bool sound_playing = false;
 
 // DJ MODE STATE
 bool dj_mode = false;
-bool dj_intro_playing = false;  // true while a DJ intro is playing
-int dj_pending_track = 0;       // track to play after intro finishes
+bool dj_intro_playing = false;
+int dj_pending_track = 0;
 unsigned long dj_intro_start = 0;
 
-// SERIAL RX COUNTER (for debugging connection)
+// LCD DISPLAY MODES (cycled with RT)
+int lcd_mode = 0;
+const int LCD_MODE_COUNT = 5; // RPM, Temp, Battery, Track, IMU Tilt
+
+// SERIAL RX COUNTER
 unsigned long rxByteCount = 0;
 unsigned long rxParseCount = 0;
-
-// DEBUG
-static bool DEBUG_RAW_BYTES = false;
 
 
 // DECLARATIONS
@@ -245,6 +281,10 @@ void updatePropeller(int triggerValue);
 void hopperSetup();
 void hopperToggle();
 void handleHopperButton(int buttons);
+void lcdSetup();
+void updateLCD();
+void imuSetup();
+void readIMU();
 void startupSequence();
 bool parseCSV(char* line, ControllerData& c);
 float applyDeadzone(float v);
@@ -268,23 +308,133 @@ bool trackHasDJIntro(int track) {
 }
 
 
-// STARTUP: plays startup sound, then fades eyes from black to white
+// initializes the I2C LCD and shows a boot message
+// address 0x27 is standard for most I2C LCD adapters (change to 0x3F if needed)
+void lcdSetup() {
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("ROBOGOOSE");
+  lcd.setCursor(0, 1);
+  lcd.print("Booting...");
+}
+
+// updates the LCD display based on the current mode, cycled by RT trigger
+// modes: 0=RPM, 1=Temp, 2=Battery, 3=Track, 4=IMU tilt (for anti-tip tuning)
+// builds each line in a char buffer then pushes to the LCD in one I2C transaction (faster)
+// pads lines to 16 chars with spaces so switching modes cleanly overwrites old text
+void updateLCD() {
+  char line0[17];
+  char line1[17];
+
+  switch (lcd_mode) {
+    case 0: // RPM mode
+      snprintf(line0, 17, "L:%-5d RPM  ", (int)velocity_left);
+      snprintf(line1, 17, "R:%-5d RPM  ", (int)velocity_right);
+      break;
+
+    case 1: // Temperature mode
+      snprintf(line0, 17, "L:%dC  R:%dC    ", temp_left, temp_right);
+      snprintf(line1, 17, "Motor Temps     ");
+      break;
+
+    case 2: // Battery mode
+      {
+        int vWhole = (int)voltage;
+        int vFrac  = (int)((voltage - vWhole) * 10);
+        snprintf(line0, 17, "%d.%dV  %d%%      ", vWhole, vFrac, (int)battery_pct);
+        snprintf(line1, 17, "Battery         ");
+      }
+      break;
+
+    case 3: // Track info mode
+      snprintf(line0, 17, "Track:%d/%-3d     ", current_track, MUSIC_TRACK_COUNT);
+      snprintf(line1, 17, "DJ:%-13s", dj_mode ? "ON" : "OFF");
+      break;
+
+    case 4: // IMU tilt mode (for anti-tip tuning)
+      if (imuReady) {
+        // show raw pitch on line 0, forward tilt from resting on line 1
+        int pitchWhole = (int)pitch;
+        int pitchFrac  = (int)(fabs(pitch - pitchWhole) * 10);
+        float fwdTilt = TILT_RESTING - pitch;
+        int fwdWhole = (int)fwdTilt;
+        int fwdFrac  = (int)(fabs(fwdTilt - fwdWhole) * 10);
+        snprintf(line0, 17, "Pitch:%d.%d    ", pitchWhole, pitchFrac);
+        snprintf(line1, 17, "Fwd:%d.%d   ", fwdWhole, fwdFrac);
+      } else {
+        snprintf(line0, 17, "IMU NOT FOUND   ");
+        snprintf(line1, 17, "Check wiring    ");
+      }
+      break;
+  }
+
+  // ensure lines are exactly 16 chars (pad with spaces if snprintf was shorter)
+  for (int i = 0; i < 16; i++) {
+    if (line0[i] == '\0') { memset(&line0[i], ' ', 16 - i); break; }
+  }
+  for (int i = 0; i < 16; i++) {
+    if (line1[i] == '\0') { memset(&line1[i], ' ', 16 - i); break; }
+  }
+  line0[16] = '\0';
+  line1[16] = '\0';
+
+  lcd.setCursor(0, 0);
+  lcd.print(line0);
+  lcd.setCursor(0, 1);
+  lcd.print(line1);
+}
+
+
+// starts up the BNO055 IMU on the I2C bus
+// the IMU shares SDA/SCL with the LCD but uses a different address (0x28 vs 0x27)
+// if it fails to init we set imuReady=false so the rest of the code knows to skip anti-tip
+void imuSetup() {
+  if (SERIAL_ENABLED) Serial.println("Initializing BNO055...");
+  if (!bno.begin()) {
+    if (SERIAL_ENABLED) Serial.println("BNO055 ERROR: check wiring (SDA=20, SCL=21)");
+    imuReady = false;
+    return;
+  }
+  delay(500); // let the IMU settle after power on
+  bno.setExtCrystalUse(true); // use external crystal for more stable readings
+  imuReady = true;
+  if (SERIAL_ENABLED) Serial.println("BNO055 ready");
+}
+
+// reads pitch angle from the IMU, called every 20ms from the main loop
+// pitch is the forward/back tilt. which axis corresponds to pitch depends on how the
+// IMU is physically mounted - if values look wrong, swap to orientation.x or .z
+// bails out fast if no IMU connected so anti-tip just never kicks in
+void readIMU() {
+  if (!imuReady) return;
+  sensors_event_t event;
+  bno.getEvent(&event);
+  pitch = event.orientation.y;                                    //CHANGE ME IF AXIS IS WRONG
+}
+
+
+// STARTUP: plays a random startup sound, then fades eyes from black to white
 void startupSequence() {
   if (dfPlayerReady) {
-    dfPlayer.playFolder(FOLDER_STARTUP, STARTUP_FILE);
-    Serial.println("Playing startup sound");
+    int startupTrack = 1 + random(STARTUP_TRACK_COUNT);
+    dfPlayer.playFolder(FOLDER_STARTUP, startupTrack);
+    if (SERIAL_ENABLED) { Serial.print("Playing startup sound: "); Serial.println(startupTrack); }
   }
-  delay(200); // let audio start before eyes begin
-  // fade eyes from off to full white (~4 seconds)
+  delay(200);
   for (int i = 0; i <= 255; i++) {
     setColor(i, i, i);
-    delay(16); // 256 steps * 16ms = ~4 seconds
+    delay(16);
   }
-  delay(500); // hold full white briefly before breathing starts
+  delay(500);
   led_r = 255;
   led_g = 255;
   led_b = 255;
   leds_off = false;
+  blinkState = 0;
+  blinkTimer = millis();
+  lcd.clear();
+  updateLCD();
 }
 
 
@@ -299,10 +449,10 @@ float addVoltageSample(float v) {
   return sum / count;
 }
 
-// converts voltage to battery percentage (3S LiPo: 10.5V empty, 12.6V full)
+// converts voltage to battery percentage (3S LiPo: 9.6V empty, 12.6V full)
 float batteryPercent(float v) {
   const float max_v = 12.6f;
-  const float min_v = 10.5f;
+  const float min_v = 9.6f;
   float pct = (v - min_v) / (max_v - min_v) * 100.0f;
   return constrain(pct, 0.0f, 100.0f);
 }
@@ -326,41 +476,51 @@ void hsvToRgb(float h, float s, float v, int &r, int &g, int &b) {
 }
 
 
-// breathing effect: sine wave with hold at peak brightness
-// squared brightness makes the dim phase much darker for a dramatic pulse
+// blink animation
 void updateBreathing() {
-  breathPhase += BREATH_SPEED;
-  if (breathPhase >= 2.0f * PI) breathPhase -= 2.0f * PI;
-  float raw = sin(breathPhase);
-  if (raw > 0.8f) raw = 1.0f; // clamp top of sine = hold at peak
-  float brightness = (raw + 1.0f) * 0.5f; // remap -1..1 to 0..1
-  brightness = brightness * brightness;    // square for deeper dimming
-  int r = (int)(led_r * brightness);
-  int g = (int)(led_g * brightness);
-  int b = (int)(led_b * brightness);
-  setColor(r, g, b);
+  unsigned long elapsed = millis() - blinkTimer;
+  float brightness = 1.0f;
+
+  switch (blinkState) {
+    case 0:
+      brightness = 1.0f;
+      if (elapsed >= BLINK_HOLD_BRIGHT) { blinkState = 1; blinkTimer = millis(); }
+      break;
+    case 1:
+      brightness = 1.0f - (1.0f - BLINK_DIM_LEVEL) * ((float)elapsed / BLINK_CLOSE_TIME);
+      if (elapsed >= BLINK_CLOSE_TIME) { brightness = BLINK_DIM_LEVEL; blinkState = 2; blinkTimer = millis(); }
+      break;
+    case 2:
+      brightness = BLINK_DIM_LEVEL;
+      if (elapsed >= BLINK_HOLD_DIM) { blinkState = 3; blinkTimer = millis(); }
+      break;
+    case 3:
+      brightness = BLINK_DIM_LEVEL + (1.0f - BLINK_DIM_LEVEL) * ((float)elapsed / BLINK_OPEN_TIME);
+      if (elapsed >= BLINK_OPEN_TIME) { brightness = 1.0f; blinkState = 0; blinkTimer = millis(); }
+      break;
+  }
+
+  if (brightness > 1.0f) brightness = 1.0f;
+  if (brightness < 0.0f) brightness = 0.0f;
+  setColor((int)(led_r * brightness), (int)(led_g * brightness), (int)(led_b * brightness));
 }
 
 
-// sets LED color based on button press
-// A = green, B = red, RS = white
-// (X, Y, LS are used for sounds/DJ mode instead of LEDs)
+// LED buttons: A = green, B = red, RS = white
 void handleLEDButtons(int buttons) {
-  if      (buttons & BTN_A)  { rainbow_mode = false; leds_off = false; led_r =   0; led_g = 255; led_b =   0; } // green
-  else if (buttons & BTN_B)  { rainbow_mode = false; leds_off = false; led_r = 255; led_g =   0; led_b =   0; } // red
-  else if (buttons & BTN_RS) { rainbow_mode = false; leds_off = false; led_r = 255; led_g = 255; led_b = 255; } // white
+  if      (buttons & BTN_A)  { rainbow_mode = false; leds_off = false; led_r =   0; led_g = 255; led_b =   0; }
+  else if (buttons & BTN_B)  { rainbow_mode = false; leds_off = false; led_r = 255; led_g =   0; led_b =   0; }
+  else if (buttons & BTN_RS) { rainbow_mode = false; leds_off = false; led_r = 255; led_g = 255; led_b = 255; }
 }
 
-// cycles through colors smoothly (perceptually even, no blue lingering)
-// uses direct sine waves on each channel offset by 120 degrees
+// rainbow cycle (no breathing)
 void updateRainbow() {
-  rainbow_hue += 2.0f; // degrees per tick (smooth cycle)
+  rainbow_hue += RAINBOW_SPEED;
   if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
   float rad = rainbow_hue * PI / 180.0f;
-  // three sine waves 120 degrees apart = smooth RGB cycling
   float r = sin(rad)           * 0.5f + 0.5f;
-  float g = sin(rad + 2.094f)  * 0.5f + 0.5f; // +120 degrees
-  float b = sin(rad + 4.189f)  * 0.5f + 0.5f; // +240 degrees
+  float g = sin(rad + 2.094f)  * 0.5f + 0.5f;
+  float b = sin(rad + 4.189f)  * 0.5f + 0.5f;
   setColor((int)(r * 255), (int)(g * 255), (int)(b * 255));
 }
 
@@ -368,105 +528,84 @@ void updateRainbow() {
 // initializes DFPlayer on hardware Serial2
 void speakerSetup() {
   Serial2.begin(9600);
-  Serial.println("Initializing DFPlayer...");
-  delay(2000); // DFPlayer needs ~2 seconds to boot
+  if (SERIAL_ENABLED) Serial.println("Initializing DFPlayer...");
+  delay(2000);
   if (!dfPlayer.begin(Serial2, false, false)) {
-    Serial.println("DFPlayer ERROR: check wiring and SD card");
+    if (SERIAL_ENABLED) Serial.println("DFPlayer ERROR: check wiring and SD card");
     dfPlayerReady = false;
     return;
   }
-  Serial.println("DFPlayer ready");
-  dfPlayer.volume(30); // max volume (0-30)
-  delay(500); // extra settle time so startup sound doesn't get missed
+  if (SERIAL_ENABLED) Serial.println("DFPlayer ready");
+  dfPlayer.volume(30);
+  delay(500);
   dfPlayerReady = true;
 }
 
 // plays a music track from folder 02
-// if DJ mode is on and this track has an intro, plays intro first then waits 5 seconds
 void playMusicTrack(int track) {
   if (!dfPlayerReady) return;
-
   if (dj_mode && trackHasDJIntro(track)) {
-    // this track has a DJ intro, play it and queue the song
-    Serial.print("DJ intro for track ");
-    Serial.println(track);
+    if (SERIAL_ENABLED) { Serial.print("DJ intro for track "); Serial.println(track); }
     dfPlayer.playFolder(FOLDER_DJ_INTRO, track);
     dj_intro_playing = true;
     dj_pending_track = track;
     dj_intro_start = millis();
     sound_playing = true;
   } else {
-    // no DJ mode or no intro, just play the song directly
-    Serial.print("Playing track ");
-    Serial.println(track);
+    if (SERIAL_ENABLED) { Serial.print("Playing track "); Serial.println(track); }
     dfPlayer.playFolder(FOLDER_MUSIC, track);
     dj_intro_playing = false;
     sound_playing = true;
   }
 }
 
-// plays a random annoying sound from folder 03 (Y button)
 void playRandomSound() {
   if (!dfPlayerReady) return;
-  int track = 1 + random(RANDOM_TRACK_COUNT); // random between 1 and count
-  Serial.print("Random sound: ");
-  Serial.println(track);
+  int track = 1 + random(RANDOM_TRACK_COUNT);
+  if (SERIAL_ENABLED) { Serial.print("Random sound: "); Serial.println(track); }
   dfPlayer.playFolder(FOLDER_RANDOM, track);
-  dj_intro_playing = false; // cancels any pending DJ intro
+  dj_intro_playing = false;
   sound_playing = true;
 }
 
-// plays a random honk from folder 04 (X button)
 void playRandomHonk() {
   if (!dfPlayerReady) return;
   int track = 1 + random(HONK_TRACK_COUNT);
-  Serial.print("Honk: ");
-  Serial.println(track);
+  if (SERIAL_ENABLED) { Serial.print("Honk: "); Serial.println(track); }
   dfPlayer.playFolder(FOLDER_HONK, track);
   dj_intro_playing = false;
   sound_playing = true;
 }
 
-// pauses whatever is currently playing
 void stopSound() {
   if (!dfPlayerReady) return;
-  Serial.println("Stopping audio");
+  if (SERIAL_ENABLED) Serial.println("Stopping audio");
   dfPlayer.pause();
   dj_intro_playing = false;
   sound_playing = false;
 }
 
-// d-pad cycles through music tracks in folder 02
-// right/left = next/prev track and auto-play
-// up = replay current track, down = stop
+// d-pad: right/left = next/prev, up = replay, down = stop
 void handleSoundDpad(int dpad) {
   static int prev_dpad = 0;
-  if (dpad == prev_dpad) return; // edge detection: only trigger on change
+  if (dpad == prev_dpad) return;
   prev_dpad = dpad;
 
   if (dpad & DPAD_RIGHT) {
     current_track++;
-    if (current_track > MUSIC_TRACK_COUNT) current_track = 1; // wrap around
-    Serial.print("Selected track: ");
-    Serial.println(current_track);
+    if (current_track > MUSIC_TRACK_COUNT) current_track = 1;
     playMusicTrack(current_track);
   }
   else if (dpad & DPAD_LEFT) {
     current_track--;
-    if (current_track < 1) current_track = MUSIC_TRACK_COUNT; // wrap around
-    Serial.print("Selected track: ");
-    Serial.println(current_track);
+    if (current_track < 1) current_track = MUSIC_TRACK_COUNT;
     playMusicTrack(current_track);
   }
-  else if (dpad & DPAD_UP) {
-    playMusicTrack(current_track); // replay current
-  }
-  else if (dpad & DPAD_DOWN) {
-    stopSound();
-  }
+  else if (dpad & DPAD_UP) { playMusicTrack(current_track); }
+  else if (dpad & DPAD_DOWN) { stopSound(); }
 }
 
-// Y button = random annoying sound (edge detection so it only fires once per press)
+// Y = random sound (edge detection)
 void handleRandomSoundButton(int buttons) {
   static bool prev_y = false;
   bool y_now = buttons & BTN_Y;
@@ -474,7 +613,7 @@ void handleRandomSoundButton(int buttons) {
   prev_y = y_now;
 }
 
-// X button = random honk (edge detection)
+// X = random honk (edge detection)
 void handleHonkButton(int buttons) {
   static bool prev_x = false;
   bool x_now = buttons & BTN_X;
@@ -482,221 +621,268 @@ void handleHonkButton(int buttons) {
   prev_x = x_now;
 }
 
-// left stick click = toggle DJ mode on/off (edge detection)
-// plays narration from folder 06 when toggling
-// enables rainbow LEDs when DJ mode turns on
+// LS = DJ mode toggle (edge detection)
 void handleDJModeToggle(int buttons) {
   static bool prev_ls = false;
   bool ls_now = buttons & BTN_LS;
-
   if (ls_now && !prev_ls) {
-    dj_mode = !dj_mode; // toggle bool
-    Serial.print("DJ Mode: ");
-    Serial.println(dj_mode ? "ON" : "OFF"); // bool ? true : false
-
-    // play the "Welcome to DJ Goose" or "Signing Off" narration
-    if (dfPlayerReady) {
-      dfPlayer.playFolder(FOLDER_DJ_SFX, dj_mode ? DJ_ON_FILE : DJ_OFF_FILE);
-    }
-
-    // turn on rainbow mode when DJ mode activates
-    if (dj_mode) {
-      rainbow_mode = true;
-      leds_off = false;
-    }
+    dj_mode = !dj_mode;
+    if (SERIAL_ENABLED) { Serial.print("DJ Mode: "); Serial.println(dj_mode ? "ON" : "OFF"); }
+    if (dfPlayerReady) { dfPlayer.playFolder(FOLDER_DJ_SFX, dj_mode ? DJ_ON_FILE : DJ_OFF_FILE); }
+    if (dj_mode) { rainbow_mode = true; leds_off = false; }
   }
   prev_ls = ls_now;
 }
 
-// waits 5 seconds for DJ intro to finish, then plays the queued music track
+// DJ intro timer
 void updateDJMode() {
   if (!dj_intro_playing) return;
-
   if (millis() - dj_intro_start >= DJ_INTRO_DURATION) {
-    Serial.print("DJ intro done, playing track ");
-    Serial.println(dj_pending_track);
+    if (SERIAL_ENABLED) { Serial.print("DJ intro done, playing track "); Serial.println(dj_pending_track); }
     dfPlayer.playFolder(FOLDER_MUSIC, dj_pending_track);
     dj_intro_playing = false;
   }
 }
 
 
-// sets up DRV8871 motor driver pins for propeller hat
+// propeller motor
 void propellerSetup() {
-  pinMode(motorIN1, OUTPUT); // direction (held LOW)
-  pinMode(motorIN2, OUTPUT); // speed (PWM)
+  pinMode(motorIN1, OUTPUT);
+  pinMode(motorIN2, OUTPUT);
   digitalWrite(motorIN1, LOW);
   analogWrite(motorIN2, 0);
-  Serial.println("Propeller motor ready");
 }
 
-// maps left trigger value to PWM (capped at 50%)
 void updatePropeller(int triggerValue) {
-  int speed = map(triggerValue, 0, 1023, 0, 128); // 128 = 50% of 255
-  if (speed < 10) speed = 0; // trigger deadzone to prevent motor creep
+  int speed = map(triggerValue, 0, 1023, 0, 128);
+  if (speed < 10) speed = 0;
   digitalWrite(motorIN1, LOW);
   analogWrite(motorIN2, speed);
 }
 
 
-// attaches hopper servo and sets to closed position
+// hopper servo
 void hopperSetup() {
   hopperServo.attach(servoPin);
   hopperServo.write(HOPPER_CLOSED);
   hopper_open = false;
-  Serial.println("Hopper servo ready");
 }
 
-// flips hopper between open and closed
 void hopperToggle() {
-  hopper_open = !hopper_open; // toggle bool
-  hopperServo.write(hopper_open ? HOPPER_OPEN : HOPPER_CLOSED); // bool ? true : false
-  Serial.print("Hopper ");
-  Serial.println(hopper_open ? "OPEN" : "CLOSED"); // bool ? true : false
+  hopper_open = !hopper_open;
+  hopperServo.write(hopper_open ? HOPPER_OPEN : HOPPER_CLOSED);
+  if (SERIAL_ENABLED) { Serial.print("Hopper "); Serial.println(hopper_open ? "OPEN" : "CLOSED"); }
 }
 
-// LB button toggles hopper (has edge detection so it doesn't spam)
+// LB = hopper toggle (edge detection)
 void handleHopperButton(int buttons) {
   static bool prev_lb = false;
   bool lb_now = buttons & BTN_LB;
-  if (lb_now && !prev_lb) hopperToggle(); // only on press, not hold
+  if (lb_now && !prev_lb) hopperToggle();
   prev_lb = lb_now;
 }
 
 
-// parses CSV from Nano: "lx,ly,rx,ry,brake,throttle,buttons,dpad\n"
+// parses the comma-separated controller data sent from the Nano ESP32 over Serial1
+// format: "lx,ly,rx,ry,brake,throttle,buttons,dpad\n"
+// walks the string character by character to build up each integer value
+// faster than strtok() which has function call overhead and modifies the input string
+// returns false if we didn't get exactly 8 fields (bad data, drop it)
 bool parseCSV(char* line, ControllerData& c) {
   int fields[8];
   int count = 0;
-  char* token = strtok(line, ",");
-  while (token != nullptr && count < 8) {
-    fields[count++] = atoi(token); // convert each field to int
-    token = strtok(nullptr, ",");
+  int val = 0;
+  bool neg = false;
+  char ch;
+
+  for (int i = 0; count < 8; i++) {
+    ch = line[i];
+    if (ch == ',' || ch == '\0') {
+      // hit a separator or end of string - save the current value and reset
+      fields[count++] = neg ? -val : val;
+      val = 0;
+      neg = false;
+      if (ch == '\0') break;
+    } else if (ch == '-') {
+      neg = true;
+    } else {
+      // accumulate digits: val = val * 10 + digit
+      val = val * 10 + (ch - '0');
+    }
   }
-  if (count != 8) return false; // reject if we didn't get all 8 fields
+
+  if (count != 8) return false; // malformed line, reject
   c.lx       = fields[0];
   c.ly       = fields[1];
   c.rx       = fields[2];
   c.ry       = fields[3];
-  c.brake    = fields[4]; // LT analog (0-1023)
-  c.throttle = fields[5]; // RT analog (0-1023)
-  c.buttons  = fields[6]; // bitmask of face buttons
-  c.dpad     = fields[7]; // bitmask of dpad directions
+  c.brake    = fields[4];
+  c.throttle = fields[5];
+  c.buttons  = fields[6];
+  c.dpad     = fields[7];
   return true;
 }
 
 
-// add deadzones, rescales remaining range to 0..1
+// deadzones
 float applyDeadzone(float v) {
   if (fabs(v) < DEADZONE) return 0;
   if (v > 0) return (v - DEADZONE) / (1.0f - DEADZONE);
   else       return (v + DEADZONE) / (1.0f - DEADZONE);
 }
 
-// makes small stick movements less sensitive, full stick still = full power
+// exponential curve - makes small stick movements gentle, full stick still hits full power
+// RESPONSE=1 is linear, RESPONSE=2 is quadratic (smoother near center, same peak)
 float applyCurve(float v) {
-  float sign = (v >= 0) ? 1.0f : -1.0f; // preserve direction
-  return pow(fabs(v), RESPONSE) * sign;  // RESPONSE=2.0 = quadratic curve
+  float sign = (v >= 0) ? 1.0f : -1.0f;
+  return pow(fabs(v), RESPONSE) * sign;
 }
 
-// converts stick positions to left/right motor duty targets
-// left stick Y = forward/back, right stick X = steering
+// converts stick positions into throttle and steering target values (-1.0 to 1.0 range)
+// this just sets targets, the actual ramping happens in updateMotorRamp
+// left stick Y = throttle (forward/back), negated so pushing up = forward
+// right stick X = steering (turning), positive = right turn
 void computeMotorFromStick() {
-  // convert from -511..512 to -1.0..1.0
-  float throttle =  controller.rx / 512.0f;
-  float steering = -controller.ly / 512.0f;
-  // apply deadzone and exponential curve
-  throttle = applyCurve(applyDeadzone(throttle));
-  steering = applyCurve(applyDeadzone(steering));
-  // tank drive mixing: left = throttle + steering, right = throttle - steering
-  float left  = throttle + steering;
-  float right = throttle - steering;
-  // normalize so neither motor exceeds 1.0
-  float maxVal = max(fabs(left), fabs(right));
-  if (maxVal > 1.0f) { left /= maxVal; right /= maxVal; }
-  // scale to MAX_DUTY (0.3 = 30% max power)
-  duty_left_target  = left  * MAX_DUTY;
-  duty_right_target = right * MAX_DUTY;
+  float rawThrottle = -controller.ly / 512.0f;
+  float rawSteering =  controller.rx / 512.0f;
+  throttle_target = applyCurve(applyDeadzone(rawThrottle));
+  steering_target = applyCurve(applyDeadzone(rawSteering));
 }
 
-// smoothly ramps current motor duty toward target (prevents jerky starts/stops)
+// ramps throttle and steering toward their targets, then mixes into motor duty cycles
+// runs every 1ms from main loop for smooth feel
+//
+// two-stage anti-tip when BNO055 sees forward lean:
+//   stage 1 (below TILT_MAX): brake softening - reduces decel rate proportionally
+//   stage 2 (above TILT_MAX): active catch boost - drives motors forward to catch the fall
+// steering doesn't get anti-tip because turning doesn't cause forward weight transfer
 void updateMotorRamp() {
-  auto rampAxis = [](float current, float target) -> float {
-    bool decelerating = fabs(target) < fabs(current);
-    float rate = decelerating ? RAMP_RATE_DECEL : RAMP_RATE_ACCEL;
+  // default to normal braking, only softens if tilt detected
+  float effectiveThrottleDecel = THROTTLE_RAMP_DECEL;
+  // active catch boost - added to both motors after mixing if tilt is extreme
+  float catchBoost = 0.0f;
+
+  if (imuReady) {
+    // how much forward lean relative to the resting pitch
+    // positive = leaning forward, negative/zero = level or leaning back
+    float forwardTilt = TILT_RESTING - pitch;
+
+    if (forwardTilt > TILT_THRESHOLD) {
+      // STAGE 1: linear brake softening between TILT_THRESHOLD and TILT_MAX
+      // 0.0 at threshold (normal brake), 1.0 at max (softest brake)
+      float tiltFactor = (forwardTilt - TILT_THRESHOLD) / (TILT_MAX - TILT_THRESHOLD);
+      tiltFactor = constrain(tiltFactor, 0.0f, 1.0f);
+      // reduce brake force: at max tilt we still brake at 10% so it doesn't just coast forever
+      // change the 0.9f to 1.0f if you want brakes to fully pause at max tilt
+      effectiveThrottleDecel = THROTTLE_RAMP_DECEL * (1.0f - tiltFactor * 0.9f);
+    }
+
+    if (forwardTilt > TILT_MAX) {
+      // STAGE 2: past the tipping zone - actively drive forward to catch the fall
+      // this is proportional to how far past TILT_MAX we are
+      // capped at CATCH_MAX so it can't go crazy if the IMU glitches or reads extreme values
+      catchBoost = (forwardTilt - TILT_MAX) * CATCH_GAIN;
+      catchBoost = constrain(catchBoost, 0.0f, CATCH_MAX);
+    }
+  }
+
+  // lambda that handles the actual ramping math
+  // "reversing" means stick flipped to opposite direction - treat as decel first so it
+  // brakes to zero before accelerating the other way (prevents coasting on stick flip)
+  auto ramp = [](float current, float target, float accel, float decel) -> float {
+    bool reversing = (current > 0.0f && target < 0.0f) || (current < 0.0f && target > 0.0f);
+    bool decelerating = reversing || (fabs(target) < fabs(current));
+    float rate = decelerating ? decel : accel;
     if      (current < target) { current += rate; if (current > target) current = target; }
     else if (current > target) { current -= rate; if (current < target) current = target; }
     return current;
   };
-  duty_left_current  = rampAxis(duty_left_current,  duty_left_target);
-  duty_right_current = rampAxis(duty_right_current, duty_right_target);
+
+  // throttle gets the adjusted decel (for stage 1 anti-tip), steering uses its own rates
+  throttle_current = ramp(throttle_current, throttle_target, THROTTLE_RAMP_ACCEL, effectiveThrottleDecel);
+  steering_current = ramp(steering_current, steering_target, STEERING_RAMP_ACCEL, STEERING_RAMP_DECEL);
+
+  // tank drive mixing: adding steering to one motor and subtracting from the other turns
+  // normalization prevents one side from exceeding 1.0 (which would clip)
+  float left  = throttle_current + steering_current;
+  float right = throttle_current - steering_current;
+  float maxVal = max(fabs(left), fabs(right));
+  if (maxVal > 1.0f) { left /= maxVal; right /= maxVal; }
+  duty_left_current  = left  * MAX_DUTY;
+  duty_right_current = right * MAX_DUTY;
+
+  // apply stage 2 catch boost equally to both motors (keeps driving straight while catching)
+  // applied AFTER mixing so steering still works normally, and AFTER MAX_DUTY scale so the
+  // save move can exceed MAX_DUTY if needed to prevent falling
+  if (catchBoost > 0.0f) {
+    duty_left_current  += catchBoost;
+    duty_right_current += catchBoost;
+    // hard cap so we never send more than 100% duty
+    duty_left_current  = constrain(duty_left_current,  -1.0f, 1.0f);
+    duty_right_current = constrain(duty_right_current, -1.0f, 1.0f);
+  }
 }
 
 
-// copies raw bytes into a CAN frame
+// CAN helpers
 void packData(can_frame &frame, const uint8_t *data, const int size) {
   for (int i = 0; i < size; i++) frame.data[i] = data[i];
 }
 
-// converts a value (like a float) to bytes, pads rest with zeros
 void createData(const void* data, byte *frame_data, const uint8_t data_size, const uint8_t total_size) {
   const byte* src = static_cast<const byte*>(data);
   for (int i = 0; i < data_size; i++)  frame_data[i] = src[i];
   for (int i = data_size; i < total_size; i++) frame_data[i] = 0;
 }
 
-// sends a motor control command over CAN to a Spark MAX
 void sendControlFrame(MCP2515::TXBn txb, const uint32_t device_id, const control_mode mode, const float setpoint) {
-  control_frame.can_id = (mode + device_id) | CAN_EFF_FLAG; // extended frame ID
+  control_frame.can_id = (mode + device_id) | CAN_EFF_FLAG;
   byte data[CONTROL_SIZE];
-  createData(&setpoint, data, 4, CONTROL_SIZE); // float = 4 bytes
+  createData(&setpoint, data, 4, CONTROL_SIZE);
   packData(control_frame, data, CONTROL_SIZE);
   mcp2515.sendMessage(txb, &control_frame);
 }
 
-// reads all pending status frames from Spark MAX controllers
-// extracts velocity, temp, current, voltage from each motor encoder
+// reads CAN status frames (only processes what we need)
 void drainCANStatus() {
   struct can_frame rx;
   while (mcp2515.readMessage(&rx) == MCP2515::ERROR_OK) {
-    uint32_t id = rx.can_id & ~CAN_EFF_FLAG; // strip extended flag
+    uint32_t id = rx.can_id & ~CAN_EFF_FLAG;
 
     if (id == (status_1 + 1)) {
-      // left motor status: velocity (4 bytes), temp, voltage, current
       memcpy(&velocity_left, rx.data, 4);
       temp_left = rx.data[4];
-      float raw_i = rx.data[6] * 0.125f;
-      if (raw_i < 40.0f) current_left = raw_i; // filter out garbage readings
-      float new_v = rx.data[5] * 0.0658f;
-      if (new_v >= 10.0f) {
+      uint16_t raw_voltage = ((uint16_t)rx.data[6] << 8) | rx.data[5];
+      float new_v = raw_voltage * 0.00782f;
+      if (new_v >= 8.0f && new_v <= 14.0f) {
         voltage = addVoltageSample(new_v);
-        // only update battery % when motors are idle (voltage sags under load)
         bool idle = fabs(duty_left_current) < 0.05f && fabs(duty_right_current) < 0.05f;
         if (idle) battery_pct = batteryPercent(voltage);
       }
       if (DEBUG_RAW_BYTES) printRawBytes("S1_L", rx);
     }
     else if (id == (status_1 + 2)) {
-      // right motor status
       memcpy(&velocity_right, rx.data, 4);
       temp_right = rx.data[4];
-      float raw_i = rx.data[6] * 0.125f;
-      if (raw_i < 40.0f) current_right = raw_i;
       if (DEBUG_RAW_BYTES) printRawBytes("S1_R", rx);
     }
-    else if (id == (status_2 + 1)) {
-      memcpy(&position_left, rx.data, 4); // encoder position left
-      if (DEBUG_RAW_BYTES) printRawBytes("S2_L", rx);
-    }
-    else if (id == (status_2 + 2)) {
-      memcpy(&position_right, rx.data, 4); // encoder position right
-      if (DEBUG_RAW_BYTES) printRawBytes("S2_R", rx);
+    // skip status_2 frames unless DEBUG_RAW_BYTES is on (saves time)
+    else if (DEBUG_RAW_BYTES) {
+      if (id == (status_2 + 1)) {
+        memcpy(&position_left, rx.data, 4);
+        printRawBytes("S2_L", rx);
+      }
+      else if (id == (status_2 + 2)) {
+        memcpy(&position_right, rx.data, 4);
+        printRawBytes("S2_R", rx);
+      }
     }
   }
 }
 
-// prints raw CAN frame bytes for debugging
+// debug: raw CAN bytes
 void printRawBytes(const char* label, const struct can_frame& frame) {
+  if (!SERIAL_ENABLED) return;
   Serial.print(label);
   Serial.print(" RAW [hex]: ");
   for (int i = 0; i < 8; i++) {
@@ -712,12 +898,13 @@ void printRawBytes(const char* label, const struct can_frame& frame) {
   Serial.println();
 }
 
-// prints all telemetry to serial monitor every 100ms
+// serial telemetry (only runs if SERIAL_ENABLED)
 void printStatus() {
+  if (!SERIAL_ENABLED) return;
   Serial.print("LY=");       Serial.print(controller.ly);
   Serial.print(" RX=");      Serial.print(controller.rx);
-  Serial.print(" | Target L="); Serial.print(duty_left_target);
-  Serial.print(" R=");       Serial.print(duty_right_target);
+  Serial.print(" | Duty L="); Serial.print(duty_left_current, 3);
+  Serial.print(" R=");       Serial.print(duty_right_current, 3);
   Serial.print(" | RPM L="); Serial.print(velocity_left);
   Serial.print(" R=");       Serial.print(velocity_right);
   Serial.print(" | Temp L="); Serial.print(temp_left);
@@ -725,9 +912,14 @@ void printStatus() {
   Serial.print("C | Volts="); Serial.print(voltage);
   Serial.print(" | Batt=");  Serial.print(battery_pct);
   Serial.print("% | Track="); Serial.print(current_track);
-  Serial.print(" | DJ=");    Serial.print(dj_mode ? "ON" : "OFF"); // bool ? true : false
+  Serial.print(" | DJ=");    Serial.print(dj_mode ? "ON" : "OFF");
   Serial.print(" | Prop=");  Serial.print(controller.brake);
-  Serial.print(" | Hopper="); Serial.print(hopper_open ? "OPEN" : "CLOSED"); // bool ? true : false
+  Serial.print(" | Hopper="); Serial.print(hopper_open ? "OPEN" : "CLOSED");
+  Serial.print(" | Btn=");   Serial.print(controller.buttons);
+  if (imuReady) {
+    Serial.print(" | Tilt="); Serial.print(pitch, 1);
+    Serial.print(" Fwd="); Serial.print(TILT_RESTING - pitch, 1);
+  }
   Serial.print(" | RX=");    Serial.print(rxByteCount);
   Serial.print("/");          Serial.println(rxParseCount);
 }
@@ -735,16 +927,13 @@ void printStatus() {
 
 // SETUP
 void setup() {
-  Serial.begin(115200);
-  randomSeed(analogRead(A0)); // seed RNG from floating analog pin
+  if (SERIAL_ENABLED) Serial.begin(115200);
 
-  // LED pins
   pinMode(redPin,   OUTPUT);
   pinMode(greenPin, OUTPUT);
   pinMode(bluePin,  OUTPUT);
-  setColor(0, 0, 0); // start off
+  setColor(0, 0, 0);
 
-  // CAN bus init (Mega SPI CS = pin 53)
   heartbeat_frame.can_id  = HEARTBEAT_ID | CAN_EFF_FLAG;
   heartbeat_frame.can_dlc = 8;
   packData(heartbeat_frame, HEARTBEAT_DATA, 8);
@@ -753,24 +942,29 @@ void setup() {
   mcp2515.setBitrate(CAN_1000KBPS, MCP_8MHZ);
   mcp2515.setNormalMode();
 
-  speakerSetup();    // DFPlayer on Serial2
-  propellerSetup();  // DRV8871 motor driver
-  hopperSetup();     // candy dispenser servo
-  Serial1.begin(9600); // controller input from Nano
+  lcdSetup();
+  imuSetup();        // BNO055 on I2C pins 20/21 (shares bus with LCD)
+  speakerSetup();
+  propellerSetup();
+  hopperSetup();
+  Serial1.begin(9600);
+  randomSeed(analogRead(A0));
 
-  startupSequence(); // play sound + fade in eyes
+  startupSequence();
 
-  Serial.println("ROBOGOOSE MEGA READY");
+  if (SERIAL_ENABLED) Serial.println("ROBOGOOSE MEGA READY");
 }
 
 
 // MAIN LOOP
 void loop() {
 
-  drainCANStatus(); // read motor telemetry
-  updateDJMode();   // check if DJ intro timer expired
+  drainCANStatus();
 
-  // read controller CSV data from Nano on Serial1
+  // only check DJ timer if an intro is actually playing
+  if (dj_intro_playing) updateDJMode();
+
+  // read controller data — process all available bytes without yielding
   while (Serial1.available()) {
     char c = Serial1.read();
     rxByteCount++;
@@ -778,58 +972,52 @@ void loop() {
       buffer[bufIdx] = '\0';
       if (bufIdx > 0 && parseCSV(buffer, controller)) {
         rxParseCount++;
-
-        computeMotorFromStick(); // convert sticks to motor targets
-
-        // LED colors: A = green, B = red, RS = white
+        computeMotorFromStick();
         handleLEDButtons(controller.buttons);
 
-        // RT (right trigger) = purple LED
-        if (controller.throttle > 10) {
-          rainbow_mode = false;
-          leds_off = false;
-          led_r = 148; led_g = 0; led_b = 211;
+        // RT = cycle LCD mode (edge detection)
+        {
+          static bool prev_rt = false;
+          bool rt_now = controller.throttle > 10;
+          if (rt_now && !prev_rt) { lcd_mode = (lcd_mode + 1) % LCD_MODE_COUNT; }
+          prev_rt = rt_now;
         }
 
-        // RB = rainbow mode (no breathing, full brightness cycling)
         if (controller.buttons & BTN_RB) { rainbow_mode = true; leds_off = false; }
-
-        handleHopperButton(controller.buttons);       // LB = hopper toggle
-        handleDJModeToggle(controller.buttons);       // LS = DJ mode toggle
-        handleRandomSoundButton(controller.buttons);  // Y = random annoying sound
-        handleHonkButton(controller.buttons);         // X = random honk
-        handleSoundDpad(controller.dpad);             // D-pad = music track selection
-        updatePropeller(controller.brake);            // LT = propeller speed
+        handleHopperButton(controller.buttons);
+        handleDJModeToggle(controller.buttons);
+        handleRandomSoundButton(controller.buttons);
+        handleHonkButton(controller.buttons);
+        handleSoundDpad(controller.dpad);
+        updatePropeller(controller.brake);
       }
       bufIdx = 0;
     } else if (c != '\r' && bufIdx < sizeof(buffer) - 1) {
       buffer[bufIdx++] = c;
     } else {
-      bufIdx = 0; // buffer overflow or carriage return, reset
+      bufIdx = 0;
     }
   }
 
   unsigned long now = millis();
 
-  // LED update (every 20ms = 50Hz)
+  // LED + IMU update (every 20ms = 50Hz)
   static unsigned long led_last = 0;
   if (now - led_last >= 20) {
-    if (rainbow_mode) {
-      updateRainbow(); // full brightness color cycling
-    } else if (!leds_off && (led_r > 0 || led_g > 0 || led_b > 0)) {
-      updateBreathing(); // breathing pulse on solid colors
-    }
+    readIMU(); // read pitch angle for anti-tip (fast, ~1ms I2C read)
+    if (rainbow_mode) updateRainbow();
+    else if (!leds_off && (led_r > 0 || led_g > 0 || led_b > 0)) updateBreathing();
     led_last = now;
   }
 
-  // motor ramp (every 1ms for smooth acceleration)
+  // motor ramp (every 1ms)
   static unsigned long ramp_last = 0;
   if (now - ramp_last >= 1) {
     updateMotorRamp();
     ramp_last = now;
   }
 
-  // CAN heartbeat (every 10ms, keeps Spark MAXes from timing out)
+  // CAN heartbeat (every 10ms)
   static unsigned long hb_last = 0;
   if (now - hb_last >= 10) {
     mcp2515.sendMessage(MCP2515::TXB0, &heartbeat_frame);
@@ -843,16 +1031,24 @@ void loop() {
     ctrl_left_last = now;
   }
 
-  // right motor command (every 10ms, offset 5ms from left to spread CAN traffic)
+  // right motor command (every 10ms, offset 5ms)
   static unsigned long ctrl_right_last = 10;
   if (now - ctrl_right_last >= 10) {
     sendControlFrame(MCP2515::TXB2, 2, Duty_Cycle_Set, duty_right_current);
     ctrl_right_last = now;
   }
 
-  // serial telemetry print (every 100ms)
+  // LCD update (every 500ms normally, 150ms when showing IMU for live tuning)
+  static unsigned long lcd_last = 0;
+  unsigned long lcd_interval = (lcd_mode == 4) ? 150 : 500;
+  if (now - lcd_last >= lcd_interval) {
+    updateLCD();
+    lcd_last = now;
+  }
+
+  // serial telemetry (every 250ms)
   static unsigned long print_last = 0;
-  if (now - print_last >= 100) {
+  if (now - print_last >= 250) {
     printStatus();
     print_last = now;
   }
