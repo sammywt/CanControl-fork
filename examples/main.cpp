@@ -58,8 +58,8 @@ bool hopper_open = false;
 // flip to false when running on battery to speed up the loop
 // serial prints block the loop for a few ms each, adds up fast
 // DEBUG_RAW_BYTES dumps the raw CAN frame bytes, only useful when decoding new status frames
-static bool SERIAL_ENABLED = false;
-static bool DEBUG_RAW_BYTES = false;
+static bool SERIAL_ENABLED = false;       //makes stuff run slower
+static bool DEBUG_RAW_BYTES = false;      //makes stuff run A LOT slower
 
 
 // SD CARD FOLDER LAYOUT
@@ -78,11 +78,13 @@ const int FOLDER_RANDOM   = 3;
 const int FOLDER_HONK     = 4;
 const int FOLDER_DJ_INTRO = 5;
 const int FOLDER_DJ_SFX   = 6;
+const int FOLDER_DEATH    = 7;   
 // track counts (can be up to 255)                              //CHANGE ME WHEN UPDATING TRACK COUNTS
-const int STARTUP_TRACK_COUNT = 3;
-const int MUSIC_TRACK_COUNT   = 20;
-const int RANDOM_TRACK_COUNT  = 16;
+const int STARTUP_TRACK_COUNT = 4;
+const int MUSIC_TRACK_COUNT   = 22;
+const int RANDOM_TRACK_COUNT  = 17;
 const int HONK_TRACK_COUNT    = 17;
+const int DEATH_TRACK_COUNT   = 4;
 // Narration On/Off toggle
 const int DJ_ON_FILE          = 1;
 const int DJ_OFF_FILE         = 2;
@@ -131,7 +133,7 @@ const uint8_t CONTROL_SIZE = 8;
 
 
 // DRIVING CONSTANTS                                        //CHANGE ME TO CHANGE SPEEDS
-const float MAX_DUTY        = 0.50f;  // cap on motor power, 1.0 = full send, keep low for safety
+const float MAX_DUTY        = 0.50f;  // cap on motor power, 1.0 = full send, keep capped for safety
 const float DEADZONE        = 0.15f;  // ignore tiny stick movements so the goose doesn't creep
 const float RESPONSE        = 2.0f;   // 1.0=linear stick, 2.0=quadratic (more precision near center)
 
@@ -152,12 +154,16 @@ const float STEERING_RAMP_DECEL = 0.005f;  // turning decel - how fast turning e
 //
 // STAGE 1 - brake softening: when forward tilt crosses TILT_THRESHOLD, the decel rate
 // gets scaled down proportionally. at TILT_MAX the brake is at 10% of normal strength.
-// this is passive - just eases off the brake so the goose settles back down.
+// this is passive - just eases off the brake so the goose settles back down
 //
 // STAGE 2 - active catch boost: when forward tilt exceeds TILT_MAX (about to tip),
 // both motors briefly drive forward to slide the wheels under the falling goose.
 // this is aggressive - the bigger CATCH_GAIN, the harder the save. too aggressive
-// and it can oscillate or drive you into stuff. start low and work up.
+// and it can oscillate or drive you into stuff
+//
+// STAGE 3 - death (failsafe): if the pitch hits DEATH_PITCH or lower, the goose has tipped over. 
+// motors cut out completely so it doesnt drive into a wall and a random death sound plays.
+// stays dead until manually reset (leveling the goose back up)
 //
 // forward tilt is (TILT_RESTING - current_pitch), so bigger = more tipping
 const float TILT_RESTING   = 14.0f;  // measured with the goose sitting level
@@ -165,6 +171,8 @@ const float TILT_THRESHOLD = 3.0f;   // when brake softening starts kicking in
 const float TILT_MAX       = 7.0f;   // when brake is at 10%, and catch boost begins
 const float CATCH_GAIN     = 0.03f;  // duty cycle added per degree of tilt past TILT_MAX
 const float CATCH_MAX      = 0.30f;  // safety cap - never add more than this much boost
+const float DEATH_PITCH    = -20.0f; // pitch angle that triggers death mode
+const float DEATH_RECOVERY_PITCH = 0.0f; // pitch must rise above this to leave death mode
 
 
 // MOTOR STATE
@@ -213,7 +221,6 @@ const int BTN_LB = (1 << 4);
 const int BTN_RB = (1 << 5);
 const int BTN_LS = (1 << 8);
 const int BTN_RS = (1 << 9);
-const int BTN_MENU = (1 << 6);                                 //CHANGE ME IF MENU BUTTON DOESN'T WORK
 
 // DPAD BITMASK VALUES (Bluepad32 format)
 const int DPAD_UP    = 0x01;
@@ -227,7 +234,7 @@ bool rainbow_mode = false;
 bool leds_off = true;
 float rainbow_hue = 0.0f;
 
-// LED BREATHING / BLINK ANIMATION                                      //CHANGE ME TO CHANGE EYES
+// LED BREATHING ANIMATION                                      //CHANGE ME TO CHANGE EYES
 const unsigned long BLINK_HOLD_BRIGHT = 2000;
 const unsigned long BLINK_CLOSE_TIME  = 600;
 const unsigned long BLINK_HOLD_DIM    = 300;
@@ -236,7 +243,7 @@ const float BLINK_DIM_LEVEL = 0.05f;
 int blinkState = 0;
 unsigned long blinkTimer = 0;
 
-// RAINBOW SPEED (adjustable)
+// RAINBOW SPEED
 const float RAINBOW_SPEED = 8.0f;
 
 // SOUND STATE
@@ -248,6 +255,11 @@ bool dj_mode = false;
 bool dj_intro_playing = false;
 int dj_pending_track = 0;
 unsigned long dj_intro_start = 0;
+
+// DEATH STATE (triggered when goose tips over past DEATH_PITCH)
+// when true, motors are disabled and a death sound plays once
+// only resets when the goose is picked up and righted (pitch rises above DEATH_RECOVERY_PITCH)
+bool is_dead = false;
 
 // LCD DISPLAY MODES (cycled with RT)
 int lcd_mode = 0;
@@ -269,6 +281,7 @@ void speakerSetup();
 void playMusicTrack(int track);
 void playRandomSound();
 void playRandomHonk();
+void playDeathSound();
 void stopSound();
 void handleSoundDpad(int dpad);
 void handleRandomSoundButton(int buttons);
@@ -354,14 +367,20 @@ void updateLCD() {
 
     case 4: // IMU tilt mode (for anti-tip tuning)
       if (imuReady) {
-        // show raw pitch on line 0, forward tilt from resting on line 1
-        int pitchWhole = (int)pitch;
-        int pitchFrac  = (int)(fabs(pitch - pitchWhole) * 10);
-        float fwdTilt = TILT_RESTING - pitch;
-        int fwdWhole = (int)fwdTilt;
-        int fwdFrac  = (int)(fabs(fwdTilt - fwdWhole) * 10);
-        snprintf(line0, 17, "Pitch:%d.%d    ", pitchWhole, pitchFrac);
-        snprintf(line1, 17, "Fwd:%d.%d   ", fwdWhole, fwdFrac);
+        if (is_dead) {
+          // override with big DEAD banner when tipped over
+          snprintf(line0, 17, "** GOOSE DEAD **");
+          snprintf(line1, 17, "Pitch:%d.%d      ", (int)pitch, (int)(fabs(pitch - (int)pitch) * 10));
+        } else {
+          // normal tilt display - raw pitch on line 0, forward tilt from resting on line 1
+          int pitchWhole = (int)pitch;
+          int pitchFrac  = (int)(fabs(pitch - pitchWhole) * 10);
+          float fwdTilt = TILT_RESTING - pitch;
+          int fwdWhole = (int)fwdTilt;
+          int fwdFrac  = (int)(fabs(fwdTilt - fwdWhole) * 10);
+          snprintf(line0, 17, "Pitch:%d.%d    ", pitchWhole, pitchFrac);
+          snprintf(line1, 17, "Fwd:%d.%d   ", fwdWhole, fwdFrac);
+        }
       } else {
         snprintf(line0, 17, "IMU NOT FOUND   ");
         snprintf(line1, 17, "Check wiring    ");
@@ -410,7 +429,7 @@ void readIMU() {
   if (!imuReady) return;
   sensors_event_t event;
   bno.getEvent(&event);
-  pitch = event.orientation.y;                                    //CHANGE ME IF AXIS IS WRONG
+  pitch = event.orientation.y;                                    
 }
 
 
@@ -438,7 +457,7 @@ void startupSequence() {
 }
 
 
-// smooths voltage readings over 20 samples
+// smooths voltage readings over samples
 float addVoltageSample(float v) {
   voltage_buf[voltage_idx] = v;
   voltage_idx = (voltage_idx + 1) % VOLTAGE_SAMPLES;
@@ -513,7 +532,7 @@ void handleLEDButtons(int buttons) {
   else if (buttons & BTN_RS) { rainbow_mode = false; leds_off = false; led_r = 255; led_g = 255; led_b = 255; }
 }
 
-// rainbow cycle (no breathing)
+// rainbow cycle
 void updateRainbow() {
   rainbow_hue += RAINBOW_SPEED;
   if (rainbow_hue >= 360.0f) rainbow_hue -= 360.0f;
@@ -573,6 +592,17 @@ void playRandomHonk() {
   int track = 1 + random(HONK_TRACK_COUNT);
   if (SERIAL_ENABLED) { Serial.print("Honk: "); Serial.println(track); }
   dfPlayer.playFolder(FOLDER_HONK, track);
+  dj_intro_playing = false;
+  sound_playing = true;
+}
+
+// plays a random death sound from folder 07 when the goose tips over
+// called once when is_dead transitions from false to true
+void playDeathSound() {
+  if (!dfPlayerReady) return;
+  int track = 1 + random(DEATH_TRACK_COUNT);
+  if (SERIAL_ENABLED) { Serial.print("DEATH: "); Serial.println(track); }
+  dfPlayer.playFolder(FOLDER_DEATH, track);
   dj_intro_playing = false;
   sound_playing = true;
 }
@@ -752,11 +782,39 @@ void computeMotorFromStick() {
 // ramps throttle and steering toward their targets, then mixes into motor duty cycles
 // runs every 1ms from main loop for smooth feel
 //
-// two-stage anti-tip when BNO055 sees forward lean:
+// three-stage anti-tip when BNO055 sees forward lean:
 //   stage 1 (below TILT_MAX): brake softening - reduces decel rate proportionally
 //   stage 2 (above TILT_MAX): active catch boost - drives motors forward to catch the fall
+//   stage 3 (pitch < DEATH_PITCH): death mode - cuts motors entirely, plays death sound
 // steering doesn't get anti-tip because turning doesn't cause forward weight transfer
 void updateMotorRamp() {
+  // DEATH CHECK - if the goose has tipped over, cut motors completely and bail out
+  // death mode triggers when pitch drops below DEATH_PITCH (robot is face down)
+  // stays dead until pitch rises above DEATH_RECOVERY_PITCH (robot is picked up and righted)
+  if (imuReady) {
+    if (!is_dead && pitch <= DEATH_PITCH) {
+      // just died - play the death sound once and enter death mode
+      is_dead = true;
+      playDeathSound();
+      if (SERIAL_ENABLED) Serial.println("GOOSE HAS FALLEN");
+    }
+    else if (is_dead && pitch > DEATH_RECOVERY_PITCH) {
+      // goose has been picked up and righted - wake up
+      is_dead = false;
+      if (SERIAL_ENABLED) Serial.println("GOOSE REVIVED");
+    }
+  }
+
+  // while dead, zero out all motor output and skip the rest of the ramp logic
+  // also zero the ramped state so we don't jump to full speed on revive
+  if (is_dead) {
+    throttle_current = 0.0f;
+    steering_current = 0.0f;
+    duty_left_current  = 0.0f;
+    duty_right_current = 0.0f;
+    return;
+  }
+
   // default to normal braking, only softens if tilt detected
   float effectiveThrottleDecel = THROTTLE_RAMP_DECEL;
   // active catch boost - added to both motors after mixing if tilt is extreme
@@ -943,7 +1001,7 @@ void setup() {
   mcp2515.setNormalMode();
 
   lcdSetup();
-  imuSetup();        // BNO055 on I2C pins 20/21 (shares bus with LCD)
+  imuSetup();
   speakerSetup();
   propellerSetup();
   hopperSetup();
@@ -1038,7 +1096,7 @@ void loop() {
     ctrl_right_last = now;
   }
 
-  // LCD update (every 500ms normally, 150ms when showing IMU for live tuning)
+  // LCD update (every 500ms normally, 150ms when showing IMU for live tuning [THIS MAKES DRIVING IS LESS RESPONSIVE])
   static unsigned long lcd_last = 0;
   unsigned long lcd_interval = (lcd_mode == 4) ? 150 : 500;
   if (now - lcd_last >= lcd_interval) {
