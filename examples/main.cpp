@@ -81,7 +81,7 @@ const int FOLDER_DJ_SFX   = 6;
 const int FOLDER_DEATH    = 7;   
 // track counts (can be up to 255)                              //CHANGE ME WHEN UPDATING TRACK COUNTS
 const int STARTUP_TRACK_COUNT = 4;
-const int MUSIC_TRACK_COUNT   = 22;
+const int MUSIC_TRACK_COUNT   = 26;
 const int RANDOM_TRACK_COUNT  = 17;
 const int HONK_TRACK_COUNT    = 17;
 const int DEATH_TRACK_COUNT   = 4;
