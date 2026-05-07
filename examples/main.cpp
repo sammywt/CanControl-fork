@@ -12,15 +12,15 @@
 // PIN ASSIGNMENTS (Arduino Mega)
 // Serial1 (19 RX) = Controller input from Nano [Purple]
 // Serial2 (16 TX, 17 RX) = DFPlayer Mini [Green, Yellow]
-// SPI (50 MISO, 51 MOSI, 52 SCK, 53 CS) = MCP2515 CAN [Gray]
-// I2C (20 SDA, 21 SCL) = 12x2 LCD with I2C adapter
-// 2  = CAN INT [Blue]
+// Serial3 (14 TX, 15 RX) = Soundboard Nano (web server) [Green, Yellow]
+// SPI (50 MISO, 51 MOSI, 52 SCK, 53 CS) = MCP2515 CAN [White, White, Purple, Gray]
+// I2C (20 SDA, 21 SCL) = 12x2 LCD with I2C adapter [Blue, Purple]
+// 2  = CAN INT [Purple]
 // 3  = Red LED (PWM)
 // 4  = Green LED (PWM)
 // 5  = Blue LED (PWM)
-// 6  = DRV8871 IN2 propeller speed (PWM) [Green]
-// 7  = DRV8871 IN1 propeller direction [White]
 // 8  = Hopper servo [Orange]
+// pins 6 and 7 are now free (used to be propeller, unused)
 
 MCP2515 mcp2515(53);
 DFRobotDFPlayerMini dfPlayer;
@@ -41,10 +41,6 @@ const int redPin   = 3;
 const int greenPin = 4;
 const int bluePin  = 5;
 
-// motor driver pins (propeller hat)
-const int motorIN1 = 7;
-const int motorIN2 = 6;
-
 // Hopper servo pin
 const int servoPin = 8;
 
@@ -63,12 +59,14 @@ static bool DEBUG_RAW_BYTES = false;      //makes stuff run A LOT slower
 
 
 // SD CARD FOLDER LAYOUT
-//   01 - startup sound
-//   02 - d pad tracks
-//   03 - annoying sounds (Y button)
-//   04 - honks           (X button)
+//   01 - startup sounds
+//   02 - d pad music tracks
+//   03 - random annoying sounds (Y button)
+//   04 - honks (X button)
 //   05 - DJGoose Intros
-//   06 - NarrationToggle (L Stick Click)
+//   06 - DJ on/off toggle sounds
+//   07 - death sounds (when goose tips over)
+//   08 - secret sounds - LT+Y plays 08/001, LT+X plays 08/002 (SECRET)
 // too lazy to list them all, check the SD card
 
 // folder number (can be up to 99)
@@ -78,13 +76,19 @@ const int FOLDER_RANDOM   = 3;
 const int FOLDER_HONK     = 4;
 const int FOLDER_DJ_INTRO = 5;
 const int FOLDER_DJ_SFX   = 6;
-const int FOLDER_DEATH    = 7;   
+const int FOLDER_DEATH    = 7;
+const int FOLDER_SECRET   = 8;
 // track counts (can be up to 255)                              //CHANGE ME WHEN UPDATING TRACK COUNTS
 const int STARTUP_TRACK_COUNT = 4;
-const int MUSIC_TRACK_COUNT   = 26;
+const int MUSIC_TRACK_COUNT   = 27;
 const int RANDOM_TRACK_COUNT  = 17;
 const int HONK_TRACK_COUNT    = 17;
 const int DEATH_TRACK_COUNT   = 4;
+// Specific tracks for LT+button combos
+const int LT_A_SOUND = 1;  // 03/001 - LT+A
+const int LT_B_SOUND = 4;  // 03/004 - LT+B
+const int LT_Y_SOUND = 1;  // 08/001 - LT+Y (secret)
+const int LT_X_SOUND = 2;  // 08/002 - LT+X (secret)
 // Narration On/Off toggle
 const int DJ_ON_FILE          = 1;
 const int DJ_OFF_FILE         = 2;
@@ -93,6 +97,13 @@ const int DJ_OFF_FILE         = 2;
 const int DJ_INTRO_TRACKS[] = {1, 2, 3, 4, 5, 8};
 const int DJ_INTRO_COUNT = 6;
 const unsigned long DJ_INTRO_DURATION = 5000;
+
+// VOLUME CONTROL                                              //CHANGE ME TO TUNE VOLUME
+// DFPlayer volume range is 0-30, we start at max and let LT+DPadUp/Down adjust it
+const int VOLUME_MAX = 30;
+const int VOLUME_MIN = 0;
+const int VOLUME_STEP = 2;  // how much each press changes the volume
+int current_volume = VOLUME_MAX;
 
 
 // LED COLOR (common cathode)
@@ -150,7 +161,7 @@ const float STEERING_RAMP_ACCEL = 0.001f;  // turning accel - lower = more gradu
 const float STEERING_RAMP_DECEL = 0.005f;  // turning decel - how fast turning eases out
 
 // ANTI-TIP SETTINGS (BNO055 IMU)                                //CHANGE ME TO TUNE ANTI-TIP
-// two-stage protection against tipping forward during hard braking:
+// two-stage protection against tipping forward during hard braking, plus death mode for crashes:
 //
 // STAGE 1 - brake softening: when forward tilt crosses TILT_THRESHOLD, the decel rate
 // gets scaled down proportionally. at TILT_MAX the brake is at 10% of normal strength.
@@ -159,20 +170,28 @@ const float STEERING_RAMP_DECEL = 0.005f;  // turning decel - how fast turning e
 // STAGE 2 - active catch boost: when forward tilt exceeds TILT_MAX (about to tip),
 // both motors briefly drive forward to slide the wheels under the falling goose.
 // this is aggressive - the bigger CATCH_GAIN, the harder the save. too aggressive
-// and it can oscillate or drive you into stuff
+// and it can drive you into stuff. only triggers if the user is actually pushing the stick
+// to prevent runaway when the IMU glitches
 //
-// STAGE 3 - death (failsafe): if the pitch hits DEATH_PITCH or lower, the goose has tipped over. 
-// motors cut out completely so it doesnt drive into a wall and a random death sound plays.
-// stays dead until manually reset (leveling the goose back up)
+// STAGE 3 - death (failsafe): if pitch goes below DEATH_PITCH (forward tip) OR above
+// DEATH_PITCH_BACK (backward tip from crashing into something), the goose is "dead".
+// motors cut out completely and a random death sound plays. stays dead until the goose
+// is righted back to a reasonable angle (between DEATH_RECOVERY_PITCH and DEATH_RECOVERY_BACK).
+// also kicks in if the IMU returns garbage data (out of IMU_PITCH range).
 //
-// forward tilt is (TILT_RESTING - current_pitch), so bigger = more tipping
-const float TILT_RESTING   = 14.0f;  // measured with the goose sitting level
+// forward tilt is (TILT_RESTING - current_pitch), so bigger = more tipping forward
+const float TILT_RESTING   = 20.0f;  // measured with the goose sitting level
 const float TILT_THRESHOLD = 3.0f;   // when brake softening starts kicking in
 const float TILT_MAX       = 7.0f;   // when brake is at 10%, and catch boost begins
 const float CATCH_GAIN     = 0.03f;  // duty cycle added per degree of tilt past TILT_MAX
 const float CATCH_MAX      = 0.30f;  // safety cap - never add more than this much boost
-const float DEATH_PITCH    = -20.0f; // pitch angle that triggers death mode
-const float DEATH_RECOVERY_PITCH = 0.0f; // pitch must rise above this to leave death mode
+const float DEATH_PITCH         = -20.0f; // pitch this low or lower = forward tip = death
+const float DEATH_PITCH_BACK    = 60.0f;  // pitch this high or higher = backward tip = death (crashing into stuff)
+const float DEATH_RECOVERY_PITCH = 0.0f;  // forward tip recovery: pitch must rise above this
+const float DEATH_RECOVERY_BACK  = 25.0f; // backward tip recovery: pitch must drop below this
+// IMU sanity range - if reading is outside this, ignore it (probably garbage from impact)
+const float IMU_PITCH_MIN = -90.0f;
+const float IMU_PITCH_MAX = 90.0f;
 
 
 // MOTOR STATE
@@ -212,6 +231,10 @@ ControllerData controller;
 char buffer[64];
 uint8_t bufIdx = 0;
 
+// SOUNDBOARD NANO BUFFER (commands from web server)
+char    sbBuffer[64];
+uint8_t sbBufIdx = 0;
+
 // BUTTON BIT MASKS (Bluepad32 format)
 const int BTN_A  = (1 << 0);
 const int BTN_B  = (1 << 1);
@@ -227,6 +250,13 @@ const int DPAD_UP    = 0x01;
 const int DPAD_DOWN  = 0x02;
 const int DPAD_RIGHT = 0x04;
 const int DPAD_LEFT  = 0x08;
+
+// LT MODIFIER STATE
+// LT (controller.brake, analog 0-1023) acts as a modifier button now
+// when held above LT_MOD_THRESHOLD, other buttons do "modifier" actions instead of normal actions
+// for example: A normally = green eyes, but LT+A = play sound 03/001
+const int LT_MOD_THRESHOLD = 100; // analog threshold for "LT is held"
+bool lt_held = false; // updated each loop
 
 // LED STATE
 int led_r = 0, led_g = 0, led_b = 0;
@@ -261,7 +291,7 @@ unsigned long dj_intro_start = 0;
 // only resets when the goose is picked up and righted (pitch rises above DEATH_RECOVERY_PITCH)
 bool is_dead = false;
 
-// LCD DISPLAY MODES (cycled with RT)
+// LCD DISPLAY MODES (cycled with LT+DPadLeft/Right)
 int lcd_mode = 0;
 const int LCD_MODE_COUNT = 5; // RPM, Temp, Battery, Track, IMU Tilt
 
@@ -281,16 +311,18 @@ void speakerSetup();
 void playMusicTrack(int track);
 void playRandomSound();
 void playRandomHonk();
+void playSpecificSound(int folder, int track);
 void playDeathSound();
 void stopSound();
+void changeVolume(int delta);
 void handleSoundDpad(int dpad);
 void handleRandomSoundButton(int buttons);
 void handleHonkButton(int buttons);
 void handleDJModeToggle(int buttons);
+void handleLTModifierButtons(int buttons, int dpad);
+void handleRTPurpleEyes(int triggerValue);
 void updateDJMode();
 bool trackHasDJIntro(int track);
-void propellerSetup();
-void updatePropeller(int triggerValue);
 void hopperSetup();
 void hopperToggle();
 void handleHopperButton(int buttons);
@@ -310,6 +342,13 @@ void sendControlFrame(MCP2515::TXBn txb, const uint32_t device_id, const control
 void drainCANStatus();
 void printRawBytes(const char* label, const struct can_frame& frame);
 void printStatus();
+// Soundboard Nano comms
+void notifySoundboardTrack(int trackId);
+void notifySoundboardStopped();
+void notifySoundboardPaused();
+void sendStatsToNano();
+void processSoundboardCommand(const char* line);
+void handleSoundboardSerial();
 
 
 // checks if a track has a matching DJ intro file in folder 05
@@ -332,7 +371,7 @@ void lcdSetup() {
   lcd.print("Booting...");
 }
 
-// updates the LCD display based on the current mode, cycled by RT trigger
+// updates the LCD display based on the current mode, cycled by LT+DPad Left/Right
 // modes: 0=RPM, 1=Temp, 2=Battery, 3=Track, 4=IMU tilt (for anti-tip tuning)
 // builds each line in a char buffer then pushes to the LCD in one I2C transaction (faster)
 // pads lines to 16 chars with spaces so switching modes cleanly overwrites old text
@@ -351,18 +390,18 @@ void updateLCD() {
       snprintf(line1, 17, "Motor Temps     ");
       break;
 
-    case 2: // Battery mode
+    case 2: // Battery mode - also shows volume so you can see it while adjusting
       {
         int vWhole = (int)voltage;
         int vFrac  = (int)((voltage - vWhole) * 10);
         snprintf(line0, 17, "%d.%dV  %d%%      ", vWhole, vFrac, (int)battery_pct);
-        snprintf(line1, 17, "Battery         ");
+        snprintf(line1, 17, "Vol:%-2d Battery  ", current_volume);
       }
       break;
 
     case 3: // Track info mode
       snprintf(line0, 17, "Track:%d/%-3d     ", current_track, MUSIC_TRACK_COUNT);
-      snprintf(line1, 17, "DJ:%-13s", dj_mode ? "ON" : "OFF");
+      snprintf(line1, 17, "DJ:%-3s Vol:%-2d   ", dj_mode ? "ON" : "OFF", current_volume);
       break;
 
     case 4: // IMU tilt mode (for anti-tip tuning)
@@ -429,7 +468,7 @@ void readIMU() {
   if (!imuReady) return;
   sensors_event_t event;
   bno.getEvent(&event);
-  pitch = event.orientation.y;                                    
+  pitch = event.orientation.y;
 }
 
 
@@ -525,11 +564,43 @@ void updateBreathing() {
 }
 
 
-// LED buttons: A = green, B = red, RS = white
+// LED buttons (only respond when LT is NOT held - LT modifies these)
+// A = green, B = red, RS = white
 void handleLEDButtons(int buttons) {
   if      (buttons & BTN_A)  { rainbow_mode = false; leds_off = false; led_r =   0; led_g = 255; led_b =   0; }
   else if (buttons & BTN_B)  { rainbow_mode = false; leds_off = false; led_r = 255; led_g =   0; led_b =   0; }
   else if (buttons & BTN_RS) { rainbow_mode = false; leds_off = false; led_r = 255; led_g = 255; led_b = 255; }
+}
+
+// RT analog trigger sets eyes to blue (held = blue, released = restores previous)
+// since RT is now an analog trigger we use a threshold to detect "held"
+void handleRTPurpleEyes(int triggerValue) {
+  static bool prev_rt_held = false;
+  static int saved_r = 0, saved_g = 0, saved_b = 0;
+  static bool saved_rainbow = false;
+  bool rt_held = (triggerValue > 100);
+
+  if (rt_held && !prev_rt_held) {
+    // RT just pressed - save current eye color and switch to blue
+    saved_r = led_r;
+    saved_g = led_g;
+    saved_b = led_b;
+    saved_rainbow = rainbow_mode;
+    rainbow_mode = false;
+    leds_off = false;
+    led_r = 0;
+    led_g = 0;
+    led_b = 255;
+  }
+  else if (!rt_held && prev_rt_held) {
+    // RT just released - restore previous color
+    led_r = saved_r;
+    led_g = saved_g;
+    led_b = saved_b;
+    rainbow_mode = saved_rainbow;
+  }
+
+  prev_rt_held = rt_held;
 }
 
 // rainbow cycle
@@ -545,6 +616,7 @@ void updateRainbow() {
 
 
 // initializes DFPlayer on hardware Serial2
+// starts at max volume - LT+DPadUp/Down adjusts it during use
 void speakerSetup() {
   Serial2.begin(9600);
   if (SERIAL_ENABLED) Serial.println("Initializing DFPlayer...");
@@ -555,12 +627,25 @@ void speakerSetup() {
     return;
   }
   if (SERIAL_ENABLED) Serial.println("DFPlayer ready");
-  dfPlayer.volume(30);
+  dfPlayer.volume(VOLUME_MAX);
+  current_volume = VOLUME_MAX;
   delay(500);
   dfPlayerReady = true;
 }
 
+// changes the DFPlayer volume by delta (positive = louder, negative = quieter)
+// clamps to VOLUME_MIN..VOLUME_MAX so it can't go out of range
+// called by the LT+DPadUp/Down handler
+void changeVolume(int delta) {
+  if (!dfPlayerReady) return;
+  current_volume += delta;
+  current_volume = constrain(current_volume, VOLUME_MIN, VOLUME_MAX);
+  dfPlayer.volume(current_volume);
+  if (SERIAL_ENABLED) { Serial.print("Volume: "); Serial.println(current_volume); }
+}
+
 // plays a music track from folder 02
+// also notifies the soundboard Nano so the web UI's Now Playing stays in sync
 void playMusicTrack(int track) {
   if (!dfPlayerReady) return;
   if (dj_mode && trackHasDJIntro(track)) {
@@ -576,6 +661,7 @@ void playMusicTrack(int track) {
     dj_intro_playing = false;
     sound_playing = true;
   }
+  notifySoundboardTrack(track);
 }
 
 void playRandomSound() {
@@ -596,6 +682,16 @@ void playRandomHonk() {
   sound_playing = true;
 }
 
+// plays a specific track from a specific folder
+// used for LT+A and LT+B which play exact files (03/001 and 03/004)
+void playSpecificSound(int folder, int track) {
+  if (!dfPlayerReady) return;
+  if (SERIAL_ENABLED) { Serial.print("Specific sound: "); Serial.print(folder); Serial.print("/"); Serial.println(track); }
+  dfPlayer.playFolder(folder, track);
+  dj_intro_playing = false;
+  sound_playing = true;
+}
+
 // plays a random death sound from folder 07 when the goose tips over
 // called once when is_dead transitions from false to true
 void playDeathSound() {
@@ -607,15 +703,18 @@ void playDeathSound() {
   sound_playing = true;
 }
 
+// stops playback and notifies the soundboard Nano so the web UI updates
 void stopSound() {
   if (!dfPlayerReady) return;
   if (SERIAL_ENABLED) Serial.println("Stopping audio");
   dfPlayer.pause();
   dj_intro_playing = false;
   sound_playing = false;
+  notifySoundboardStopped();
 }
 
-// d-pad: right/left = next/prev, up = replay, down = stop
+// d-pad WITHOUT LT held: right/left = next/prev music track, up = replay, down = stop
+// d-pad WITH LT held: handled by handleLTModifierButtons() instead (volume + LCD)
 void handleSoundDpad(int dpad) {
   static int prev_dpad = 0;
   if (dpad == prev_dpad) return;
@@ -635,7 +734,7 @@ void handleSoundDpad(int dpad) {
   else if (dpad & DPAD_DOWN) { stopSound(); }
 }
 
-// Y = random sound (edge detection)
+// Y = random sound (edge detection, only when LT not held)
 void handleRandomSoundButton(int buttons) {
   static bool prev_y = false;
   bool y_now = buttons & BTN_Y;
@@ -643,7 +742,7 @@ void handleRandomSoundButton(int buttons) {
   prev_y = y_now;
 }
 
-// X = random honk (edge detection)
+// X = random honk (edge detection, only when LT not held)
 void handleHonkButton(int buttons) {
   static bool prev_x = false;
   bool x_now = buttons & BTN_X;
@@ -664,6 +763,61 @@ void handleDJModeToggle(int buttons) {
   prev_ls = ls_now;
 }
 
+// handles all LT-modifier combinations
+// only called when lt_held is true, so we don't need to check LT inside again
+// LT+A    = play sound 03/001 (specific track)
+// LT+B    = play sound 03/004 (specific track)
+// LT+Y    = play sound 08/001 (secret)
+// LT+X    = play sound 08/002 (secret)
+// LT+DPadUp    = volume up
+// LT+DPadDown  = volume down
+// LT+DPadLeft  = previous LCD mode
+// LT+DPadRight = next LCD mode
+// edge-detected so each button press triggers once
+void handleLTModifierButtons(int buttons, int dpad) {
+  // LT+A
+  static bool prev_lt_a = false;
+  bool lt_a_now = buttons & BTN_A;
+  if (lt_a_now && !prev_lt_a) {
+    playSpecificSound(FOLDER_RANDOM, LT_A_SOUND);
+  }
+  prev_lt_a = lt_a_now;
+
+  // LT+B
+  static bool prev_lt_b = false;
+  bool lt_b_now = buttons & BTN_B;
+  if (lt_b_now && !prev_lt_b) {
+    playSpecificSound(FOLDER_RANDOM, LT_B_SOUND);
+  }
+  prev_lt_b = lt_b_now;
+
+  // LT+Y (secret 1)
+  static bool prev_lt_y = false;
+  bool lt_y_now = buttons & BTN_Y;
+  if (lt_y_now && !prev_lt_y) {
+    playSpecificSound(FOLDER_SECRET, LT_Y_SOUND);
+  }
+  prev_lt_y = lt_y_now;
+
+  // LT+X (secret 2)
+  static bool prev_lt_x = false;
+  bool lt_x_now = buttons & BTN_X;
+  if (lt_x_now && !prev_lt_x) {
+    playSpecificSound(FOLDER_SECRET, LT_X_SOUND);
+  }
+  prev_lt_x = lt_x_now;
+
+  // LT+DPad - all 4 directions edge detected from a single dpad value
+  static int prev_lt_dpad = 0;
+  if (dpad != prev_lt_dpad) {
+    if      (dpad & DPAD_UP)    { changeVolume(VOLUME_STEP); }
+    else if (dpad & DPAD_DOWN)  { changeVolume(-VOLUME_STEP); }
+    else if (dpad & DPAD_RIGHT) { lcd_mode = (lcd_mode + 1) % LCD_MODE_COUNT; }
+    else if (dpad & DPAD_LEFT)  { lcd_mode = (lcd_mode - 1 + LCD_MODE_COUNT) % LCD_MODE_COUNT; }
+    prev_lt_dpad = dpad;
+  }
+}
+
 // DJ intro timer
 void updateDJMode() {
   if (!dj_intro_playing) return;
@@ -672,22 +826,6 @@ void updateDJMode() {
     dfPlayer.playFolder(FOLDER_MUSIC, dj_pending_track);
     dj_intro_playing = false;
   }
-}
-
-
-// propeller motor
-void propellerSetup() {
-  pinMode(motorIN1, OUTPUT);
-  pinMode(motorIN2, OUTPUT);
-  digitalWrite(motorIN1, LOW);
-  analogWrite(motorIN2, 0);
-}
-
-void updatePropeller(int triggerValue) {
-  int speed = map(triggerValue, 0, 1023, 0, 128);
-  if (speed < 10) speed = 0;
-  digitalWrite(motorIN1, LOW);
-  analogWrite(motorIN2, speed);
 }
 
 
@@ -710,6 +848,150 @@ void handleHopperButton(int buttons) {
   bool lb_now = buttons & BTN_LB;
   if (lb_now && !prev_lb) hopperToggle();
   prev_lb = lb_now;
+}
+
+
+// 
+// SOUNDBOARD NANO COMMS (Serial3)
+// 
+// Protocol:
+//   Nano -> Mega:
+//     MUSIC:NN      play music track from folder 02
+//     HONK:NN       play specific honk from folder 04
+//     HONK:RND      play random honk
+//     SOUND:NN      play specific sound from folder 03
+//     SOUND:RND     play random sound
+//     NEXT / PREV   skip music tracks
+//     PAUSE / RESUME / STOP
+//     VOL:NN | VOL:UP | VOL:DOWN
+//
+//   Mega -> Nano:
+//     TRACK:NN      music track started
+//     STOPPED       playback stopped
+//     PAUSED        playback paused
+//     STATS:vL,vR,tL,tR,V,B,vol,trk,dj,hop,pitch,dead,playing
+//                   periodic telemetry dump (every 500 ms)
+
+void notifySoundboardTrack(int trackId) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "TRACK:%02d", trackId);
+  Serial3.println(buf);
+}
+
+void notifySoundboardStopped() {
+  Serial3.println("STOPPED");
+}
+
+void notifySoundboardPaused() {
+  Serial3.println("PAUSED");
+}
+
+// CSV: velL,velR,tempL,tempR,voltage,batt%,vol,track,dj,hop,pitch,dead,playing
+void sendStatsToNano() {
+  Serial3.print("STATS:");
+  Serial3.print((int)velocity_left);  Serial3.print(',');
+  Serial3.print((int)velocity_right); Serial3.print(',');
+  Serial3.print(temp_left);           Serial3.print(',');
+  Serial3.print(temp_right);          Serial3.print(',');
+  Serial3.print(voltage, 1);          Serial3.print(',');
+  Serial3.print((int)battery_pct);    Serial3.print(',');
+  Serial3.print(current_volume);      Serial3.print(',');
+  Serial3.print(current_track);       Serial3.print(',');
+  Serial3.print(dj_mode ? 1 : 0);     Serial3.print(',');
+  Serial3.print(hopper_open ? 1 : 0); Serial3.print(',');
+  Serial3.print(pitch, 1);            Serial3.print(',');
+  Serial3.print(is_dead ? 1 : 0);     Serial3.print(',');
+  Serial3.println(sound_playing ? 1 : 0);
+}
+
+void processSoundboardCommand(const char* line) {
+  // ── MUSIC:NN ──────────────────────────────────────────
+  if (strncmp(line, "MUSIC:", 6) == 0) {
+    int t = atoi(line + 6);
+    if (t >= 1 && t <= MUSIC_TRACK_COUNT) {
+      current_track = t;
+      playMusicTrack(t);
+    }
+  }
+  // ── HONK:NN or HONK:RND ───────────────────────────────
+  else if (strncmp(line, "HONK:", 5) == 0) {
+    if (line[5] == 'R') {
+      playRandomHonk();
+    } else {
+      int t = atoi(line + 5);
+      if (t >= 1 && t <= HONK_TRACK_COUNT) {
+        playSpecificSound(FOLDER_HONK, t);
+      }
+    }
+  }
+  // ── SOUND:NN or SOUND:RND ─────────────────────────────
+  else if (strncmp(line, "SOUND:", 6) == 0) {
+    if (line[6] == 'R') {
+      playRandomSound();
+    } else {
+      int t = atoi(line + 6);
+      if (t >= 1 && t <= RANDOM_TRACK_COUNT) {
+        playSpecificSound(FOLDER_RANDOM, t);
+      }
+    }
+  }
+  // ── Transport ─────────────────────────────────────────
+  else if (strcmp(line, "NEXT") == 0) {
+    current_track++;
+    if (current_track > MUSIC_TRACK_COUNT) current_track = 1;
+    playMusicTrack(current_track);
+  }
+  else if (strcmp(line, "PREV") == 0) {
+    current_track--;
+    if (current_track < 1) current_track = MUSIC_TRACK_COUNT;
+    playMusicTrack(current_track);
+  }
+  else if (strcmp(line, "PAUSE") == 0) {
+    if (dfPlayerReady) {
+      dfPlayer.pause();
+      sound_playing = false;
+      notifySoundboardPaused();
+    }
+  }
+  else if (strcmp(line, "RESUME") == 0) {
+    if (dfPlayerReady) {
+      dfPlayer.start();
+      sound_playing = true;
+      notifySoundboardTrack(current_track);
+    }
+  }
+  else if (strcmp(line, "STOP") == 0) {
+    stopSound();
+  }
+  // ── Volume ────────────────────────────────────────────
+  else if (strncmp(line, "VOL:", 4) == 0) {
+    if (strcmp(line + 4, "UP") == 0)        changeVolume(VOLUME_STEP);
+    else if (strcmp(line + 4, "DOWN") == 0) changeVolume(-VOLUME_STEP);
+    else {
+      int v = atoi(line + 4);
+      v = constrain(v, VOLUME_MIN, VOLUME_MAX);
+      current_volume = v;
+      if (dfPlayerReady) dfPlayer.volume(v);
+    }
+  }
+}
+
+// reads serial bytes from the soundboard Nano and dispatches complete lines
+void handleSoundboardSerial() {
+  while (Serial3.available()) {
+    char c = (char)Serial3.read();
+    if (c == '\n') {
+      sbBuffer[sbBufIdx] = '\0';
+      if (sbBufIdx > 0) processSoundboardCommand(sbBuffer);
+      sbBufIdx = 0;
+    } else if (c == '\r') {
+      // ignore carriage return, don't reset
+    } else if (sbBufIdx < sizeof(sbBuffer) - 1) {
+      sbBuffer[sbBufIdx++] = c;
+    } else {
+      sbBufIdx = 0;  // overflow protection
+    }
+  }
 }
 
 
@@ -789,17 +1071,31 @@ void computeMotorFromStick() {
 // steering doesn't get anti-tip because turning doesn't cause forward weight transfer
 void updateMotorRamp() {
   // DEATH CHECK - if the goose has tipped over, cut motors completely and bail out
-  // death mode triggers when pitch drops below DEATH_PITCH (robot is face down)
-  // stays dead until pitch rises above DEATH_RECOVERY_PITCH (robot is picked up and righted)
+  // death mode triggers in 3 ways:
+  //   1. pitch <= DEATH_PITCH (forward tip - face down)
+  //   2. pitch >= DEATH_PITCH_BACK (backward tip - happens when crashing into walls)
+  //   3. pitch outside IMU sanity range (sensor returning garbage from impact)
+  // stays dead until pitch returns to a reasonable upright range
   if (imuReady) {
-    if (!is_dead && pitch <= DEATH_PITCH) {
+    bool imu_garbage = (pitch < IMU_PITCH_MIN || pitch > IMU_PITCH_MAX);
+    bool tipped_forward = (pitch <= DEATH_PITCH);
+    bool tipped_backward = (pitch >= DEATH_PITCH_BACK);
+
+    if (!is_dead && (tipped_forward || tipped_backward || imu_garbage)) {
       // just died - play the death sound once and enter death mode
       is_dead = true;
       playDeathSound();
-      if (SERIAL_ENABLED) Serial.println("GOOSE HAS FALLEN");
+      if (SERIAL_ENABLED) {
+        Serial.print("GOOSE HAS FALLEN (pitch=");
+        Serial.print(pitch);
+        if (tipped_forward)  Serial.print(" forward tip)");
+        if (tipped_backward) Serial.print(" backward tip)");
+        if (imu_garbage)     Serial.print(" IMU garbage)");
+        Serial.println();
+      }
     }
-    else if (is_dead && pitch > DEATH_RECOVERY_PITCH) {
-      // goose has been picked up and righted - wake up
+    else if (is_dead && !imu_garbage && pitch > DEATH_RECOVERY_PITCH && pitch < DEATH_RECOVERY_BACK) {
+      // goose is back to a reasonable upright angle and IMU is sane - wake up
       is_dead = false;
       if (SERIAL_ENABLED) Serial.println("GOOSE REVIVED");
     }
@@ -808,6 +1104,8 @@ void updateMotorRamp() {
   // while dead, zero out all motor output and skip the rest of the ramp logic
   // also zero the ramped state so we don't jump to full speed on revive
   if (is_dead) {
+    throttle_target = 0.0f;
+    steering_target = 0.0f;
     throttle_current = 0.0f;
     steering_current = 0.0f;
     duty_left_current  = 0.0f;
@@ -839,6 +1137,7 @@ void updateMotorRamp() {
       // STAGE 2: past the tipping zone - actively drive forward to catch the fall
       // this is proportional to how far past TILT_MAX we are
       // capped at CATCH_MAX so it can't go crazy if the IMU glitches or reads extreme values
+      // works regardless of stick input so you can demo by kicking the goose
       catchBoost = (forwardTilt - TILT_MAX) * CATCH_GAIN;
       catchBoost = constrain(catchBoost, 0.0f, CATCH_MAX);
     }
@@ -961,6 +1260,8 @@ void printStatus() {
   if (!SERIAL_ENABLED) return;
   Serial.print("LY=");       Serial.print(controller.ly);
   Serial.print(" RX=");      Serial.print(controller.rx);
+  Serial.print(" | LT=");    Serial.print(controller.brake);
+  Serial.print(" RT=");      Serial.print(controller.throttle);
   Serial.print(" | Duty L="); Serial.print(duty_left_current, 3);
   Serial.print(" R=");       Serial.print(duty_right_current, 3);
   Serial.print(" | RPM L="); Serial.print(velocity_left);
@@ -969,11 +1270,12 @@ void printStatus() {
   Serial.print("C R=");      Serial.print(temp_right);
   Serial.print("C | Volts="); Serial.print(voltage);
   Serial.print(" | Batt=");  Serial.print(battery_pct);
-  Serial.print("% | Track="); Serial.print(current_track);
+  Serial.print("% | Vol=");  Serial.print(current_volume);
+  Serial.print(" | Track="); Serial.print(current_track);
   Serial.print(" | DJ=");    Serial.print(dj_mode ? "ON" : "OFF");
-  Serial.print(" | Prop=");  Serial.print(controller.brake);
   Serial.print(" | Hopper="); Serial.print(hopper_open ? "OPEN" : "CLOSED");
   Serial.print(" | Btn=");   Serial.print(controller.buttons);
+  Serial.print(" | LCD=");   Serial.print(lcd_mode);
   if (imuReady) {
     Serial.print(" | Tilt="); Serial.print(pitch, 1);
     Serial.print(" Fwd="); Serial.print(TILT_RESTING - pitch, 1);
@@ -1003,9 +1305,9 @@ void setup() {
   lcdSetup();
   imuSetup();
   speakerSetup();
-  propellerSetup();
   hopperSetup();
-  Serial1.begin(9600);
+  Serial1.begin(9600); // controller Nano
+  Serial3.begin(9600); // soundboard Nano (web server)
   randomSeed(analogRead(A0));
 
   startupSequence();
@@ -1016,6 +1318,13 @@ void setup() {
 
 // MAIN LOOP
 void loop() {
+
+  // DEBUG: dump anything coming in on Serial3
+  //while (Serial3.available()) {
+    //char c = Serial3.read();
+    //if (SERIAL_ENABLED) Serial.print(c);
+  //}
+  //return; // bail out so nothing else runs
 
   drainCANStatus();
 
@@ -1031,23 +1340,28 @@ void loop() {
       if (bufIdx > 0 && parseCSV(buffer, controller)) {
         rxParseCount++;
         computeMotorFromStick();
-        handleLEDButtons(controller.buttons);
 
-        // RT = cycle LCD mode (edge detection)
-        {
-          static bool prev_rt = false;
-          bool rt_now = controller.throttle > 10;
-          if (rt_now && !prev_rt) { lcd_mode = (lcd_mode + 1) % LCD_MODE_COUNT; }
-          prev_rt = rt_now;
+        // check if LT is held - this gates whether buttons do normal or modifier actions
+        // controller.brake is the LT analog trigger value (0-1023)
+        lt_held = (controller.brake > LT_MOD_THRESHOLD);
+
+        // RT (controller.throttle) sets eyes purple when held - works regardless of LT
+        handleRTPurpleEyes(controller.throttle);
+
+        if (lt_held) {
+          // LT held - run modifier handlers only
+          // these handle: LT+A, LT+B, LT+DPad combos
+          handleLTModifierButtons(controller.buttons, controller.dpad);
+        } else {
+          // LT not held - run all the normal handlers
+          handleLEDButtons(controller.buttons);
+          if (controller.buttons & BTN_RB) { rainbow_mode = true; leds_off = false; }
+          handleHopperButton(controller.buttons);
+          handleDJModeToggle(controller.buttons);
+          handleRandomSoundButton(controller.buttons);
+          handleHonkButton(controller.buttons);
+          handleSoundDpad(controller.dpad);
         }
-
-        if (controller.buttons & BTN_RB) { rainbow_mode = true; leds_off = false; }
-        handleHopperButton(controller.buttons);
-        handleDJModeToggle(controller.buttons);
-        handleRandomSoundButton(controller.buttons);
-        handleHonkButton(controller.buttons);
-        handleSoundDpad(controller.dpad);
-        updatePropeller(controller.brake);
       }
       bufIdx = 0;
     } else if (c != '\r' && bufIdx < sizeof(buffer) - 1) {
@@ -1056,6 +1370,9 @@ void loop() {
       bufIdx = 0;
     }
   }
+
+  // process incoming commands from soundboard Nano
+  handleSoundboardSerial();
 
   unsigned long now = millis();
 
@@ -1096,7 +1413,7 @@ void loop() {
     ctrl_right_last = now;
   }
 
-  // LCD update (every 500ms normally, 150ms when showing IMU for live tuning [THIS MAKES DRIVING IS LESS RESPONSIVE])
+  // LCD update (every 500ms normally, 150ms when showing IMU for live tuning [makes driving less responsive])
   static unsigned long lcd_last = 0;
   unsigned long lcd_interval = (lcd_mode == 4) ? 150 : 500;
   if (now - lcd_last >= lcd_interval) {
@@ -1109,5 +1426,12 @@ void loop() {
   if (now - print_last >= 250) {
     printStatus();
     print_last = now;
+  }
+
+  // soundboard Nano stats dump (every 500ms)
+  static unsigned long stats_last = 0;
+  if (now - stats_last >= 500) {
+    sendStatsToNano();
+    stats_last = now;
   }
 }
