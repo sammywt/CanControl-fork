@@ -14,7 +14,7 @@
 // Serial2 (16 TX, 17 RX) = DFPlayer Mini [Green, Yellow]
 // Serial3 (14 TX, 15 RX) = Soundboard Nano (web server) [Green, Yellow]
 // SPI (50 MISO, 51 MOSI, 52 SCK, 53 CS) = MCP2515 CAN [White, White, Purple, Gray]
-// I2C (20 SDA, 21 SCL) = 12x2 LCD with I2C adapter [Blue, Purple]
+// I2C (20 SDA, 21 SCL) = 16x2 LCD with I2C adapter [Blue, Purple]
 // 2  = CAN INT [Purple]
 // 3  = Red LED (PWM)
 // 4  = Green LED (PWM)
