@@ -19,8 +19,9 @@
 // 3  = Red LED (PWM)
 // 4  = Green LED (PWM)
 // 5  = Blue LED (PWM)
+// 6  = DRV8871 IN2 propeller speed (PWM) [Green] (unused)
+// 7  = DRV8871 IN1 propeller direction [White] (unused)
 // 8  = Hopper servo [Orange]
-// pins 6 and 7 are now free (used to be propeller, unused)
 
 MCP2515 mcp2515(53);
 DFRobotDFPlayerMini dfPlayer;
@@ -40,6 +41,10 @@ float pitch = 0.0f; // current forward/back tilt angle in degrees
 const int redPin   = 3;
 const int greenPin = 4;
 const int bluePin  = 5;
+
+// motor driver pins (propeller hat)
+const int motorIN1 = 7;
+const int motorIN2 = 6;
 
 // Hopper servo pin
 const int servoPin = 8;
@@ -80,7 +85,7 @@ const int FOLDER_DEATH    = 7;
 const int FOLDER_SECRET   = 8;
 // track counts (can be up to 255)                              //CHANGE ME WHEN UPDATING TRACK COUNTS
 const int STARTUP_TRACK_COUNT = 4;
-const int MUSIC_TRACK_COUNT   = 27;
+const int MUSIC_TRACK_COUNT   = 29;
 const int RANDOM_TRACK_COUNT  = 17;
 const int HONK_TRACK_COUNT    = 17;
 const int DEATH_TRACK_COUNT   = 4;
@@ -180,7 +185,7 @@ const float STEERING_RAMP_DECEL = 0.005f;  // turning decel - how fast turning e
 // also kicks in if the IMU returns garbage data (out of IMU_PITCH range).
 //
 // forward tilt is (TILT_RESTING - current_pitch), so bigger = more tipping forward
-const float TILT_RESTING   = 20.0f;  // measured with the goose sitting level
+const float TILT_RESTING   = 16.0f;  // measured with the goose sitting level
 const float TILT_THRESHOLD = 3.0f;   // when brake softening starts kicking in
 const float TILT_MAX       = 7.0f;   // when brake is at 10%, and catch boost begins
 const float CATCH_GAIN     = 0.03f;  // duty cycle added per degree of tilt past TILT_MAX
@@ -828,6 +833,20 @@ void updateDJMode() {
   }
 }
 
+// propeller motor (UNUSED FOR NOW, add it in, it was used with the analog trigger before modifying it)
+void propellerSetup() {
+  pinMode(motorIN1, OUTPUT);
+  pinMode(motorIN2, OUTPUT);
+  digitalWrite(motorIN1, LOW);
+  analogWrite(motorIN2, 0);
+}
+
+void updatePropeller(int triggerValue) {
+  int speed = map(triggerValue, 0, 1023, 0, 128);
+  if (speed < 10) speed = 0;
+  digitalWrite(motorIN1, LOW);
+  analogWrite(motorIN2, speed);
+}
 
 // hopper servo
 void hopperSetup() {
